@@ -32,17 +32,22 @@ doctests, and its own compiler again — stage2 self-hosts to within 0.02%.
 
 ## Use it
 
-    ./trustup install
-    eval "$(./trustup env)"
-    cargo new hello && cd hello && cargo build --release
+    curl -sSfL https://raw.githubusercontent.com/dbarth/tinyrust/master/install.sh | sh
+    cargo new hello && cd hello && cargo run --release
 
-`trustup` is the rustup replacement. Everything lives under one directory;
-nothing touches `~/.rustup`, `~/.cargo` or `PATH`, and `rm -rf toolchain` is the
-uninstaller.
+No prompt: there is one profile and it is the small one. The toolchain goes to
+`~/.rustup/toolchains/tinyrust` — rustup's own layout, so the two coexist and
+`rustup default tinyrust` works if a rustup ever turns up — and the binaries are
+linked into `~/.cargo/bin`, which is added to your shell profile. `~/.cargo`
+itself is not our choice: cargo creates it for the registry cache regardless.
+
+To test the installer against a working copy rather than GitHub:
+
+    TINYRUST_SOURCE=$PWD TINYRUST_DIST=$PWD/dist sh install.sh
 
 | | |
 |---|---|
-| `trustup install [DIR]` | fetch components directly, no rustup |
+| `trustup install [DIR]` | fetch components, no rustup (default `~/.rustup`) |
 | `trustup install --rustup` | drive rustup, then delete what it over-installed |
 | `trustup trim` | remove what a build never reads (`--rustup` only) |
 | `trustup component list` | what is installed, what else is on offer |
