@@ -2,3 +2,4 @@ toolchain/
 llvm/
 rust/
 build.log
+dist/

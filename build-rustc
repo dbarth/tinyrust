@@ -10,6 +10,7 @@
 #   build-rustc trim       drop the llvm-tools nothing calls
 #   build-rustc bundle     pull non-system libs into the toolchain, repoint, re-sign
 #   build-rustc verify     fail if any binary links outside /usr/lib and /System
+#   build-rustc dist       package components + manifest for trustup to install
 #   build-rustc measure    compare the result against the stock toolchain
 #
 # See PLAN-rustc.md for why this should work and what it cannot fix.
@@ -281,14 +282,83 @@ cmd_trim() {
 # repoint the binary at it with @loader_path, which is the same trick trustup
 # uses for libLLVM.dylib. install_name_tool invalidates the code signature, so
 # both files are re-signed ad-hoc -- unsigned Mach-O will not run on arm64.
+# Package the toolchain the way rust's own dist does, so trustup needs no new
+# code path to install it: <pkg>-<version>-<triple>.tar.xz containing
+# <pkg>-<version>-<triple>/<component>/<files>, plus a channel manifest giving
+# a URL and a SHA-256 per component. Point TRUSTUP_DIST at the output directory
+# and TRUSTUP_CHANNEL at the channel name to install from it.
+cmd_dist() {
+  local out="$SRC/build/$TRIPLE/stage$STAGE"
+  [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
+  local dist="$HERE/dist" chan="${TRUSTUP_CHANNEL:-local}"
+  rm -rf "$dist"; mkdir -p "$dist"
+
+  local mf="$dist/channel-rust-$chan.toml"
+  printf '# Written by build-rustc dist. Not an official rust manifest.\n' > "$mf"
+  printf 'version = "%s"\n\n' "$VERSION" >> "$mf"
+
+  pack() { # pack <pkg> <files-relative-to-out...>
+    local pkg="$1"; shift
+    local stem="$pkg-$VERSION-$TRIPLE"
+    local stage="$dist/.stage/$stem/$pkg"
+    rm -rf "$dist/.stage"; mkdir -p "$stage"
+    local f
+    for f in "$@"; do
+      [ -e "$out/$f" ] || continue
+      mkdir -p "$stage/$(dirname "$f")"
+      cp -R "$out/$f" "$stage/$(dirname "$f")/"
+    done
+    ( cd "$dist/.stage" && tar cf - "$stem" ) | xz -9 -T0 > "$dist/$stem.tar.xz"
+    rm -rf "$dist/.stage"
+    local hash; hash="$(shasum -a 256 "$dist/$stem.tar.xz" | cut -d' ' -f1)"
+    cat >> "$mf" <<TOML
+[pkg.$pkg.target.$TRIPLE]
+available = true
+xz_url = "file://$dist/$stem.tar.xz"
+xz_hash = "$hash"
+
+TOML
+    ls -l "$dist/$stem.tar.xz" | awk -v p="$pkg" '{printf "  %-10s %6.1f MB\n", p, $5/1048576}'
+  }
+
+  say "packaging stage$STAGE"
+  # The compiler, its driver, the bundled libraries it needs, and the
+  # per-target binaries (rust-objcopy) that rustc shells out to.
+  local rustc_files="bin/rustc bin/rustdoc lib/rustlib/$TRIPLE/bin"
+  local d
+  for d in "$out"/lib/*.dylib; do
+    [ -e "$d" ] && rustc_files="$rustc_files lib/$(basename "$d")"
+  done
+  pack rustc $rustc_files
+  pack cargo bin/cargo
+  local t
+  for t in $TARGETS; do
+    [ -d "$out/lib/rustlib/$t/lib" ] || continue
+    if [ "$t" = "$TRIPLE" ]; then
+      pack rust-std "lib/rustlib/$t/lib"
+    else
+      note "skipping $t -- one manifest entry per triple is not modelled yet"
+    fi
+  done
+
+  echo
+  say "install it with"
+  note "TRUSTUP_DIST=file://$dist TRUSTUP_CHANNEL=$chan ./trustup install <dir>"
+}
+
 cmd_bundle() {
   local out="$SRC/build/$TRIPLE/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
-  local f dep libdir base n=0
+  # Bundled libraries go in the prefix's own lib/, not beside whatever binary
+  # needed them: lib/rustlib/<triple>/lib belongs to the rust-std component, and
+  # a file dropped there would straddle two packages when dist splits them.
+  local f dep libdir base rel n=0
+  libdir="$out/lib"
 
   while IFS= read -r f; do
     case "$(file -b "$f" 2>/dev/null)" in *Mach-O*) ;; *) continue ;; esac
-    libdir="$(dirname "$f")/../lib"
+    rel="$(python3 -c 'import os,sys;print(os.path.relpath(sys.argv[1], sys.argv[2]))' \
+            "$libdir" "$(dirname "$f")")"
     while IFS= read -r dep; do
       case "$dep" in
         /usr/lib/*|/System/*|@*|"") continue ;;
@@ -299,11 +369,11 @@ cmd_bundle() {
       if [ ! -f "$libdir/$base" ]; then
         cp -L "$dep" "$libdir/$base"
         chmod u+w "$libdir/$base"
-        install_name_tool -id "@loader_path/$base" "$libdir/$base" 2>/dev/null
+        install_name_tool -id "@rpath/$base" "$libdir/$base" 2>/dev/null
         codesign -f -s - "$libdir/$base" 2>/dev/null
       fi
       chmod u+w "$f"
-      install_name_tool -change "$dep" "@loader_path/../lib/$base" "$f" 2>/dev/null
+      install_name_tool -change "$dep" "@loader_path/$rel/$base" "$f" 2>/dev/null
       codesign -f -s - "$f" 2>/dev/null
       note "bundled $base for $(basename "$f")"
       n=$((n + 1))
@@ -428,7 +498,8 @@ case "${1:-}" in
   strip)     cmd_strip ;;
   trim)      cmd_trim ;;
   bundle)    cmd_bundle ;;
+  dist)      cmd_dist ;;
   verify)    cmd_verify ;;
   measure)   cmd_measure ;;
-  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac
