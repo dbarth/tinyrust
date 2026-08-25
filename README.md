@@ -99,12 +99,18 @@ How the small toolchain is produced. Not needed to use tinyrust.
     ./build-rustc build          # RUSTC_STAGE=2 for self-hosted
     ./build-rustc strip trim     # drop symbols, drop unused llvm-tools
     ./build-rustc measure
-    ./build-rustc dist           # 62 MB of tarballs + a channel manifest
+    ./build-rustc dist           # tarballs + a channel manifest, fat LTO only
 
     TRUSTUP_DIST=$PWD/dist ./trustup install /tmp/t
 
-`dist` packages one `rust-std` per target. trustup installs the host's; the
-others wait for `target add`.
+`dist` packages one `rust-std` per target, and clippy, rustfmt, rust-analyzer
+and miri as their own components. trustup installs the host's std; the rest wait
+for `component add`.
+
+Released artifacts are always `RUSTC_LTO=fat` — worth 15.3 MB across the tools
+and 5.1 MB on the compiler, and `dist` refuses a tree built any other way. It is
+an installed-size lever, not a download one: `xz` already removes most of what
+LTO does.
 
 ## Compiler, −46%
 
