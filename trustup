@@ -1,25 +1,26 @@
 #!/usr/bin/env bash
 #
-# trustup -- install the smallest Rust toolchain that still builds for THIS
-# machine, and nothing else.
+# trustup -- tiny-rustup. Installs the smallest Rust toolchain that builds for
+# THIS machine, and passes everything else to rustup.
 #
-#   trustup install [DIR]     fetch the three components directly (default)
+#   trustup install [DIR]     fetch components directly (default ~/.rustup)
 #   trustup install --rustup  drive rustup, then delete what it over-installed
 #   trustup trim              remove what a build never reads (--rustup only)
 #   trustup component list    what is installed, and what else is on offer
-#   trustup component add N   add one
+#   trustup component add N   add one, from this dist or the official one
 #   trustup size              where the bytes are
 #   trustup env               shell lines to use it
-#   trustup <anything else>   passed through to rustup (--rustup installs only)
+#   trustup --version         what this is and which toolchain it manages
+#   trustup <anything else>   passed to rustup, fetched on first use
+#
+# The toolchain goes to ~/.rustup/toolchains/tinyrust -- rustup's own layout, so
+# the two coexist -- and its binaries are linked into ~/.cargo/bin, which is
+# added to your shell profile. An existing rustup is never overwritten. Removing
+# the toolchain directory and those links removes it.
 #
 # TRUSTUP_DIST=/path/to/dist installs a toolchain built by ./build-rustc dist
 # instead of the official one.
 #
-# Everything lives under one directory. Nothing touches ~/.rustup, ~/.cargo or
-# PATH -- `trustup env` prints what to source, and removing the directory
-# removes the toolchain.
-#
-# See README.md for what cannot be made smaller and why.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -271,7 +272,9 @@ upstream_is_independent() {
 # Invoked as `rustup` this must not pretend to be rustup. Say what it is, what
 # toolchain it manages, and how to get the real thing.
 cmd_identity() {
-  local p; p="$(prefix 2>/dev/null || true)"
+  # `|| true` has to sit outside the substitution: prefix dies with exit, which
+  # ends the subshell before any `|| true` inside it could run.
+  local p; p="$(prefix 2>/dev/null)" || p=""
   say "trustup -- a thin rustup wrapper, installing a tinyrust toolchain"
   if [ -n "$p" ] && [ -x "$p/bin/rustc" ]; then
     note "toolchain  $("$p/bin/rustc" --version 2>/dev/null) at $p"
@@ -520,7 +523,7 @@ case "${1:-}" in
   trim) cmd_trim ;;
   size) cmd_size ;;
   env)  cmd_env ;;
-  ""|-h|--help|help) cmd_identity; sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+  ""|-h|--help|help) cmd_identity; sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' ;;
   -V|--version|version) cmd_identity ;;
   *) passthrough "$@" ;;
 esac
