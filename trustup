@@ -12,8 +12,8 @@
 #   trustup env               shell lines to use it
 #   trustup <anything else>   passed through to rustup (--rustup installs only)
 #
-# TRUSTUP_DIST=file://.../dist TRUSTUP_CHANNEL=local installs a toolchain built
-# by ./build-rustc dist instead of the official one.
+# TRUSTUP_DIST=/path/to/dist installs a toolchain built by ./build-rustc dist
+# instead of the official one.
 #
 # Everything lives under one directory. Nothing touches ~/.rustup, ~/.cargo or
 # PATH -- `trustup env` prints what to source, and removing the directory
@@ -25,11 +25,14 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${TRUSTUP_ROOT:-$HERE/toolchain}"
 
-CHANNEL="${TRUSTUP_CHANNEL:-stable}"
+# A local dist is always the "local" channel -- pointing TRUSTUP_DIST at a
+# directory is the whole switch, there is no second variable to set.
+CHANNEL="${TRUSTUP_CHANNEL:-$([ -n "${TRUSTUP_DIST:-}" ] && echo local || echo stable)}"
 # Point TRUSTUP_DIST at a directory of tarballs written by `build-rustc dist`
 # (a file:// URL works -- curl handles it) to install a locally built toolchain
 # instead of the official one. Same manifest format, same fetch path.
 DIST="${TRUSTUP_DIST:-https://static.rust-lang.org/dist}"
+case "$DIST" in */|*://*) ;; *) DIST="file://$DIST" ;; esac
 
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -238,21 +241,32 @@ cmd_trim() {
 # failing with something obscure.
 passthrough() {
   local verb="$1"; shift
-  if [ -x "$ROOT/cargo/bin/rustup" ]; then
-    export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
-    exec "$ROOT/cargo/bin/rustup" "$verb" "$@"
+  ensure_rustup
+  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
+  exec "$ROOT/cargo/bin/rustup" "$verb" "$@"
+}
+
+# rustup is fetched the first time a verb needs it, not asked about. It is
+# installed with no toolchain of its own -- the one already here is linked in
+# as "tinyrust" and made default, so `rustup show`, `which`, `target add` and
+# the rest operate on this toolchain rather than downloading a second one.
+ensure_rustup() {
+  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
+  if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+    say "fetching rustup (first use of a passed-through command)"
+    mkdir -p "$ROOT"
+    local init="$ROOT/rustup-init.sh"
+    [ -f "$init" ] || curl -sSfL "https://sh.rustup.rs" -o "$init" \
+      || die "could not download rustup-init"
+    sh "$init" -y --no-modify-path --profile minimal \
+       --default-toolchain none >/dev/null 2>&1 \
+      || die "rustup-init failed"
   fi
-  cat >&2 <<EOF
-trustup: '$verb' is passed through to rustup, and this toolchain was installed
-without one. Either use it directly:
-
-  rustc, cargo and rustdoc are on PATH after: eval "\$($0 env)"
-
-or reinstall with rustup underneath, which keeps every rustup verb working:
-
-  $0 install --rustup
-EOF
-  exit 1
+  local p; p="$(prefix)"
+  if [ -d "$p" ] && ! "$CARGO_HOME/bin/rustup" toolchain list 2>/dev/null | grep -q '^tinyrust'; then
+    "$CARGO_HOME/bin/rustup" toolchain link tinyrust "$p" >/dev/null 2>&1 || true
+    "$CARGO_HOME/bin/rustup" default tinyrust >/dev/null 2>&1 || true
+  fi
 }
 
 cmd_component() {

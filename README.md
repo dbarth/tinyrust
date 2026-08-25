@@ -52,9 +52,10 @@ uninstaller.
 | `trustup env` | shell lines to use it |
 | anything else | passed through to `rustup` |
 
-Only the verbs where tinyrust differs are intercepted; `update`, `default`,
-`toolchain`, `target`, `show` and the rest go to the real rustup, which exists
-under `--rustup` installs.
+Only the verbs where tinyrust differs are intercepted. `update`, `default`,
+`toolchain`, `target`, `show` and the rest go to the real rustup, which is
+fetched on first use and linked to the toolchain already installed — no second
+download, nothing to opt into.
 
 It reads the channel manifest, downloads three tarballs, checks their SHA-256
 and untars them. No TOML parser and no 11 MB `rustup` binary: `curl`, `shasum`
@@ -77,8 +78,8 @@ they are never written at all:
 - The tiny packages are built and installed locally, not published. Real pulls
   will be GitHub Actions artifacts; today it is
   `TRUSTUP_DIST=file://$PWD/dist TRUSTUP_CHANNEL=local ./trustup install`.
-- Passthrough needs a rustup, so it works on `--rustup` installs only. A direct
-  install has no `update` and no `target add`.
+- `update` on a linked toolchain does not rebuild it; reinstalling is
+  `rm -rf` and `trustup install`.
 - A direct install of *official* components still excludes `bin/rustdoc`, so
   doctests fail there. Locally built packages are not pruned and keep it.
 - No `rustup update`, no `+nightly`, no second toolchain. Reinstalling is
@@ -101,7 +102,10 @@ How the small toolchain is produced. Not needed to use tinyrust.
     ./build-rustc measure
     ./build-rustc dist           # 62 MB of tarballs + a channel manifest
 
-    TRUSTUP_DIST=file://$PWD/dist TRUSTUP_CHANNEL=local ./trustup install /tmp/t
+    TRUSTUP_DIST=$PWD/dist ./trustup install /tmp/t
+
+`dist` packages one `rust-std` per target. trustup installs the host's; the
+others wait for `target add`.
 
 ## Compiler, −46%
 
