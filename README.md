@@ -19,13 +19,13 @@ macOS aarch64, rustc 1.98.0, one std target. Measured, not estimated.
 |---|---|---|
 | `rustup`, default profile | — | 1.4 GB |
 | official components, no rustup | 84 MB | 381 MB |
-| **tinyrust** | **62 MB** | **271 MB** |
+| **tinyrust** | **62 MB** | **262 MB** |
 
 | | stock | tinyrust | |
 |---|---|---|---|
-| compiler + LLVM | 212.7 MB | 115.4 MB | −46% |
-| std | 128.9 MB | 112.4 MB | −13% |
-| cargo, rustdoc, rust-objcopy | 77.2 MB | 43.1 MB | −44% |
+| compiler + LLVM | 212.7 MB | 110.3 MB | −48% |
+| std | 128.9 MB | 111.7 MB | −13% |
+| cargo, rustdoc, rust-objcopy | 77.2 MB | 39.5 MB | −49% |
 
 Builds a crate with a crates.io dependency, `strip = true` release profiles,
 doctests, and its own compiler again — stage2 self-hosts to within 0.02%.
@@ -35,9 +35,11 @@ doctests, and its own compiler again — stage2 self-hosts to within 0.02%.
     curl -sSfL https://raw.githubusercontent.com/dbarth/tinyrust/master/install.sh | sh
     cargo new hello && cd hello && cargo run --release
 
-No prompt: there is one profile and it is the small one. `rustup` is aliased to
-`trustup`, so existing habits and scripts keep working — but it does not pretend
-to be rustup:
+No prompt: one profile, the small one. Goes to `~/.rustup/toolchains/tinyrust`,
+links into `~/.cargo/bin`, adds that to your shell profile. An existing rustup
+is never touched — its shims are left alone and you use `trustup` by name.
+
+`rustup` is aliased to `trustup` but does not pretend to be it:
 
     $ rustup --version
     trustup -- a thin rustup wrapper, installing a tinyrust toolchain
@@ -46,95 +48,48 @@ to be rustup:
       the real one, fetched on demand. For the full official toolchain:
         trustup install --rustup
 
-Start small, switch to the full toolchain with the same tool if you ever need
-it. An existing rustup is never touched: its `rustup`, `cargo`, `rustc` and
-`rustdoc` in `~/.cargo/bin` are left alone and you use `trustup` by name. The toolchain goes to
-`~/.rustup/toolchains/tinyrust` — rustup's own layout, so the two coexist and
-`rustup default tinyrust` works if a rustup ever turns up — and the binaries are
-linked into `~/.cargo/bin`, which is added to your shell profile. `~/.cargo`
-itself is not our choice: cargo creates it for the registry cache regardless.
+| | |
+|---|---|
+| `trustup install [DIR]` | fetch components, no rustup |
+| `trustup install --rustup` | drive rustup, then trim what it over-installed |
+| `trustup component list\|add` | resolve against the manifest |
+| `trustup size` | where the bytes are |
+| `trustup env` | shell lines to use it |
+| anything else | passed to rustup, fetched on first use |
 
-trustup installs itself into `~/.rustup/toolchains/tinyrust/bin`, and every link
-in `~/.cargo/bin` points there — so the install does not depend on where it was
-run from, and deleting the checkout breaks nothing.
-
-To test the installer against a working copy rather than GitHub:
-
-    TINYRUST_SOURCE=$PWD TINYRUST_DIST=$PWD/dist sh install.sh
+`component add` resolves three ways and never mixes silently:
 
 | | |
 |---|---|
-| `trustup install [DIR]` | fetch components, no rustup (default `~/.rustup`) |
-| `trustup install --rustup` | drive rustup, then delete what it over-installed |
-| `trustup trim` | remove what a build never reads (`--rustup` only) |
-| `trustup component list` | what is installed, what else is on offer |
-| `trustup component add N` | add one — clippy, rustfmt, rust-analyzer |
-| `trustup size` | where the bytes are |
-| `trustup env` | shell lines to use it |
-| anything else | passed through to `rustup` |
+| in this dist | `rustc`, `rust-std`, `cargo`, `clippy`, `rustfmt`, `rust-analyzer`, `miri` |
+| `upstream-ok` | official dist — `rust-docs`, `rust-src`, `llvm-tools` |
+| anything else | refused |
 
-Only the verbs where tinyrust differs are intercepted. `update`, `default`,
-`toolchain`, `target`, `show` and the rest go to the real rustup, which is
-fetched on first use and linked to the toolchain already installed — no second
-download, nothing to opt into.
-
-It reads the channel manifest, downloads three tarballs, checks their SHA-256
-and untars them. No TOML parser and no 11 MB `rustup` binary: `curl`, `shasum`
-and `tar` already cover TLS, verification and `.tar.xz`.
-
-Four things are excluded during extraction rather than deleted afterwards, so
-they are never written at all:
-
-| | | |
-|---|---|---|
-| `share/doc` | 17 MB | this installs a compiler |
-| `bin/rustdoc` | 11 MB | **but `cargo test` needs it for doctests — see Not done** |
-| 4 × sanitizer runtime | 13 MB | `-Zsanitizer` is nightly-only |
-| `wasm-component-ld` | 5 MB | reachable only from an uninstalled wasm target |
-
-`rust-lld` (5.4 MB) stays: it is the default linker for some targets.
+Rust writes the compiler version string into crate metadata, so anything loading
+an `.rmeta` or linking `librustc_driver` must be built by *this* compiler —
+mixing gives `E0514`. trustup re-checks each upstream component after unpacking.
 
 ## Not done
 
-- The tiny packages are built and installed locally, not published. Real pulls
-  will be GitHub Actions artifacts; today it is
-  `TRUSTUP_DIST=file://$PWD/dist TRUSTUP_CHANNEL=local ./trustup install`.
-- `update` on a linked toolchain does not rebuild it; reinstalling is
-  `rm -rf` and `trustup install`.
-- A direct install of *official* components still excludes `bin/rustdoc`, so
-  doctests fail there. Locally built packages are not pruned and keep it.
-- No `rustup update`, no `+nightly`, no second toolchain. Reinstalling is
-  `rm -rf toolchain && ./trustup install`.
-- macOS aarch64 only. `./llvm` is wasmer's prebuilt LLVM 22.1.8.
-- Nothing pinned: `trustup` takes whatever the stable manifest points at today.
-
-`PLAN-rustc.md` has the derivations and the measurements behind each number.
+- Packages are built locally, not published. Real pulls will be release
+  artifacts; today it is `TRUSTUP_DIST=$PWD/dist trustup install`.
+- No `update`: reinstall is `rm -rf ~/.rustup/toolchains/tinyrust && trustup install`.
+- macOS aarch64 only. Nothing pinned — `trustup` takes today's stable manifest.
+- Neither CI workflow has run yet.
 
 # Development
 
-How the small toolchain is produced. Not needed to use tinyrust.
+Not needed to use tinyrust. `PLAN-rustc.md` has the derivations.
 
-## build-rustc
-
+    ./build-rustc llvm           # wasmer's LLVM, pruned: 457 MB -> 768 MB kept
     ./build-rustc fetch          # rust 1.98.0 + cargo submodule
-    ./build-rustc configure      # bootstrap.toml pointing at ./llvm
-    ./build-rustc build          # RUSTC_STAGE=2 for self-hosted
-    ./build-rustc strip trim     # drop symbols, drop unused llvm-tools
-    ./build-rustc measure
-    ./build-rustc dist           # tarballs + a channel manifest, fat LTO only
+    ./build-rustc configure
+    RUSTC_LTO=fat RUSTC_STAGE=2 ./build-rustc build
+    ./build-rustc trim           # drop the llvm-tools nothing calls
+    ./build-rustc strip          # drop symbols from the compiler and tools
+    ./build-rustc dist           # tarballs + manifest; refuses non-fat trees
 
-    TRUSTUP_DIST=$PWD/dist ./trustup install /tmp/t
-
-`dist` packages one `rust-std` per target, and clippy, rustfmt, rust-analyzer
-and miri as their own components. trustup installs the host's std; the rest wait
-for `component add`.
-
-Released artifacts are always `RUSTC_LTO=fat` — worth 15.3 MB across the tools
-and 5.1 MB on the compiler, and `dist` refuses a tree built any other way. It is
-an installed-size lever, not a download one: `xz` already removes most of what
-LTO does.
-
-## Compiler, −46%
+## Where the compiler's −48% comes from
 
 `librustc_driver` calls 638 of `libLLVM.dylib`'s 158,946 symbols. A shared
 library exports everything; static archives let the linker take only what is
@@ -142,40 +97,19 @@ called.
 
     static link, 2 targets    212.3 -> 149.0 MB
     strip -x                  149.0 -> 115.4 MB
-    RUSTC_LTO=fat, opt-in     115.4 -> 110.3 MB, 3x build time
+    fat LTO                   115.4 -> 110.3 MB, 3x build time
 
 Backends: x86, x86_64, aarch64. `llvm-config-lean` hides the rest from
 `--components`, which drives both the `LLVMInitialize*` cfgs and the link line.
-`--print target-list` still names 330 triples; dropped ones fail codegen with
-`could not create LLVM TargetMachine`.
+`--print target-list` still names 330 triples; dropped ones fail codegen.
 
-## Tools, 43.1 MB of 205
+Fat LTO is worth 15.3 MB across the tools and 5.1 MB on the compiler — an
+installed-size lever, not a download one, since `xz` already removes most of it.
 
-| | | |
-|---|---|---|
-| cargo | 28.6 MB | nothing else resolves dependencies |
-| rustdoc | 10.3 MB | `cargo test` needs it for doctests |
-| rust-objcopy | 4.1 MB | rustc requires it for `-Cstrip` |
-| dropped | 201 MB | `llc` and `opt` are 118.7 MB of it |
+## llvm-tools: 205 MB in, 4.1 MB kept
 
-`trustup component add` resolves in three ways, and never mixes silently:
-
-| | |
-|---|---|
-| in this dist | taken from it — `rustc`, `rust-std`, `cargo` |
-| declared `upstream-ok` | taken from the official dist — `rust-docs`, `rust-src`, `llvm-tools` |
-| anything else | refused — `clippy`, `rustfmt`, `rust-analyzer`, `miri` |
-
-Rust writes the exact compiler version string into crate metadata, so anything
-that loads an `.rmeta` or links `librustc_driver` must be built by *this*
-compiler. Mixing gives `E0514: found crate std compiled by an incompatible
-version of rustc`. Everything else only runs rustc or carries no code — official
-cargo drives this rustc correctly.
-
-`rust-analyzer` looks independent and is not: the toolchain build links
-`librustc_driver` for proc-macro expansion. The list is therefore a claim, not a
-guarantee, so trustup re-checks each upstream component after unpacking it and
-refuses one that turns out to link the driver.
+`llc` and `opt` are 118.7 MB of it and rustc never invokes them. `rust-objcopy`
+stays because rustc requires it for `-Cstrip`.
 
 ## No binary links outside the OS
 
@@ -193,5 +127,13 @@ Two were found by hand, the third by `verify`.
     std .rmeta    99.7 MB   89% of std, required, cannot shrink
     std .rlib     10.1 MB
 
-`debuginfo-level-std = 0` already saves 17.5 MB; the cost is line numbers for
+`debuginfo-level-std = 0` saves 17.5 MB; the cost is line numbers for
 precompiled std frames in backtraces.
+
+## CI
+
+`llvm.yml` prunes wasmer's LLVM once and publishes it (115 MB packed);
+`release.yml` consumes that and builds the toolchain. macOS specifics: the build
+leaves ~15 GB of intermediates against ~14 GB free on a runner (Xcode is deleted
+first), macOS minutes bill at 10x on private repos, and binaries are ad-hoc
+signed but not notarized.
