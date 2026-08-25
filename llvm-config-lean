@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+#
+# llvm-config wrapper -- presents ./llvm as though it had been configured with
+# -DLLVM_TARGETS_TO_BUILD="X86;AArch64".
+#
+# rustc_llvm/build.rs reads `--components` once and uses it for two things: it
+# emits one `llvm_component="..."` cfg per entry (gating the LLVMInitialize*
+# externs in rustc_llvm/src/lib.rs, which are the linker's only roots into a
+# backend), and it passes the same list to `--libs` to build the link line.
+# Drop a target here and rustc both stops referencing it and stops linking it.
+#
+# The archives for the dropped targets stay on disk; they simply never reach
+# the linker. For rustc the result is what a two-target LLVM would have given,
+# because each backend lives in its own set of archives.
+#
+# See PLAN-rustc.md.
+set -euo pipefail
+
+REAL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/llvm-config.real"
+
+# Targets present in this LLVM that we do not want rustc to support. Matching
+# is case-insensitive and by prefix, which covers both the lowercase component
+# names (`riscv`, `riscvcodegen`, `riscvtargetmca`, ...) and the capitalised
+# names `--targets-built` reports (`RISCV`, `WebAssembly`, `LoongArch`).
+DROP='riscv|webassembly|loongarch'
+
+filter() {
+  awk -v drop="$DROP" '
+    { for (i = 1; i <= NF; i++)
+        if (tolower($i) !~ "^(" drop ")") printf "%s%s", (n++ ? " " : ""), $i }
+    END { print "" }'
+}
+
+# --system-libs. This LLVM was built against zstd and libxml2, and llvm-config
+# names both on every link of librustc_driver. Measured against this build:
+#
+#   libxml2  is reached only from libLLVMWindowsManifest.a, which is not on
+#            rustc's link line at all. The built driver contains zero `xml`
+#            references. It is dead weight, so drop it.
+#
+#   zstd     is reached from Compression.cpp.o inside libLLVMSupport.a, which
+#            *is* pulled in (rustc's own LLVMRustLLVMHasZstdCompression calls
+#            it). It cannot be dropped without rebuilding LLVM with
+#            -DLLVM_ENABLE_ZSTD=OFF. What we can do is link it statically:
+#            rustc_llvm/build.rs turns an absolute path to a .a in this output
+#            into `cargo:rustc-link-lib=static=zstd` (its own comment uses
+#            libzstd as the example). That removes the dependency on Homebrew's
+#            libzstd.1.dylib, which otherwise leaves the toolchain unable to
+#            run on a machine without Homebrew.
+zstd_archive() {
+  local c
+  for c in ${TINYRUST_ZSTD_A:-} \
+           "$(brew --prefix zstd 2>/dev/null)/lib/libzstd.a" \
+           /opt/homebrew/lib/libzstd.a /usr/local/lib/libzstd.a /usr/lib/libzstd.a; do
+    [ -n "$c" ] && [ -f "$c" ] && { printf '%s' "$c"; return; }
+  done
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --system-libs)
+      a=$(zstd_archive)
+      "$REAL" "$@" | awk -v zstd="$a" '
+        { for (i = 1; i <= NF; i++) {
+            if ($i == "-lxml2") continue
+            if ($i == "-lzstd" && zstd != "") $i = zstd
+            printf "%s%s", (n++ ? " " : ""), $i } }
+        END { print "" }'
+      exit "${PIPESTATUS[0]}"
+      ;;
+  esac
+done
+
+for arg in "$@"; do
+  case "$arg" in
+    --components|--targets-built)
+      "$REAL" "$@" | filter
+      exit "${PIPESTATUS[0]}"
+      ;;
+  esac
+done
+
+exec "$REAL" "$@"

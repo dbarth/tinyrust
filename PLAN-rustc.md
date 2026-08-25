@@ -33,9 +33,10 @@ Eight components. Not one of them is ORC, CodeView, PDB, or an object reader.
 
 ## The backends are 94 explicit roots
 
-`librustc_driver` references 94 `LLVMInitialize*` symbols — five per
-architecture (`Target`, `TargetInfo`, `TargetMC`, `AsmParser`, `AsmPrinter`)
-across all 18 backends. Each is behind `#[cfg(llvm_component = "…")]`, driven by
+`librustc_driver` in the stock toolchain references 94 `LLVMInitialize*`
+symbols — five per architecture (`Target`, `TargetInfo`, `TargetMC`,
+`AsmParser`, `AsmPrinter`) across all 18 backends. This build emits **10**, for
+x86 and aarch64 only. Each is behind `#[cfg(llvm_component = "…")]`, driven by
 `OPTIONAL_COMPONENTS` in the same `build.rs`. Those cfgs follow whatever
 `llvm-config --targets-built` reports, so an LLVM with fewer targets makes rustc
 emit fewer roots, and the linker pulls fewer backends. Nothing to patch.
@@ -58,15 +59,72 @@ archives), `usr/include` (headers), and six binaries. The other 113 are clang
 and the `llvm-*` tools, each statically linking LLVM — 1.7 GB of pure
 duplication, and `clang-repl` alone is 100 MB.
 
-### The compromise, stated plainly
+### Restricting to two targets, without rebuilding LLVM
 
-Wasmer built five targets. We want one. Using their build means rustc emits 25
-initializer roots instead of 5, and links five backends instead of AArch64.
+Wasmer built five targets. We want **x86 and aarch64** — a host compiler that
+can also cross-compile to the other architecture anyone actually ships on.
 
-That is the price of not building LLVM ourselves. Take it for the first attempt:
-it proves the toolchain end to end and costs no build time. If the result is
-promising, build LLVM with `-DLLVM_TARGETS_TO_BUILD=AArch64` and repeat — the
-rustc side does not change, because it follows `llvm-config`.
+The plan above says the cfgs follow whatever `llvm-config` reports and that
+there is nothing to patch. That is literally true, and it is enough. Reading
+`rustc_llvm/build.rs`, `--components` is consulted exactly once (line 222) and
+drives *both* halves of the problem:
+
+- line 233 — one `cargo:rustc-cfg=llvm_component="…"` per entry, which gates the
+  `LLVMInitialize*` externs in `rustc_llvm/src/lib.rs`. Those externs are the
+  linker's **only** roots into a backend; `grep -rn 'InitializeAll'` over
+  `rustc_codegen_llvm` and `rustc_llvm` (shim included) returns nothing, so
+  there is no escape hatch that reaches a backend another way.
+- line 368 — the same list is passed to `--libs`, which *is* the link line.
+
+So `llvm/bin/llvm-config` is now a wrapper that drops `riscv`, `webassembly`
+and `loongarch` from `--components` and `--targets-built`; the original is kept
+beside it as `llvm-config.real`. Measured effect on the static link line:
+
+    88 archives  ->  71 archives
+    dropped:  6 RISCV, 6 WebAssembly, 5 LoongArch  (15.4 MB on disk)
+    residual references to the three:  0
+
+Because each backend lives in its own archives, this gives **the same rustc a
+two-target LLVM would have given**. What it does not do is shrink `llvm/`
+itself — the 15.4 MB of dropped archives stay on disk. They are a build-time
+input that is never distributed, so this does not affect the number that
+matters. Rebuilding LLVM with `-DLLVM_TARGETS_TO_BUILD="X86;AArch64"` would
+reclaim them and nothing else, at the cost of fetching the source, installing
+ninja, and a full LLVM build.
+
+### The system libraries llvm-config drags in
+
+`llvm-config --system-libs` reported `-lm -lzstd -lxml2`, and both extras turn
+out to be worth attacking — for different reasons.
+
+**libxml2 is dead weight.** It is reachable only from
+`libLLVMWindowsManifest.a`, which is not on rustc's link line at all; the built
+`librustc_driver` contains zero `xml` references. Dropped.
+
+**zstd cannot simply be dropped.** It is reached from `Compression.cpp.o`
+inside `libLLVMSupport.a`, and that member *is* pulled in — rustc's own
+`LLVMRustLLVMHasZstdCompression` (RustWrapper.cpp:1815) calls into it. Removing
+`-lzstd` would be an undefined-symbol link failure. Only rebuilding LLVM with
+`-DLLVM_ENABLE_ZSTD=OFF` would remove the reference itself.
+
+But `-lzstd` was hiding a worse problem. It resolved against Homebrew, so the
+compiler came out with a hard dependency on
+
+    /opt/homebrew/opt/zstd/lib/libzstd.1.dylib
+
+which means that `rustc` **would not run on a machine without Homebrew**. The
+fix is one rustc already supports: `rustc_llvm/build.rs` turns an absolute path
+to a `.a` in the `--system-libs` output into `cargo:rustc-link-lib=static=zstd`
+— its own comment uses libzstd as the worked example. So the `llvm-config`
+wrapper rewrites `-lzstd` to the path of `libzstd.a`.
+
+    before   @rpath, libSystem, libobjc, Foundation, libz, libc++, libiconv,
+             libxml2.2.dylib, /opt/homebrew/opt/zstd/lib/libzstd.1.dylib
+    after    @rpath, libSystem, libobjc, Foundation, libz, libc++, libiconv
+
+Nothing outside `/usr/lib` and `/System` remains. Cost: **+0.3 MB** (148.7 ->
+149.0), for 242 zstd symbols moved inside and one non-portable dependency
+removed.
 
 ## Steps
 
@@ -88,7 +146,9 @@ rustc side does not change, because it follows `llvm-config`.
    ```
 
 3. **`./x build`** — stage0 is downloaded, stage1 compiles the compiler, std is
-   built twice. Hours, not minutes.
+   built twice. ~~Hours, not minutes.~~ In practice **90 seconds** for stage1
+   and **4 minutes** for stage2: supplying a prebuilt LLVM removes the part of
+   a bootstrap that actually takes hours.
 
 4. **Measure** `librustc_driver` and compare against the 79.2 MB of the stock
    build, and the total against 390 MB.
@@ -118,3 +178,67 @@ on it.
 - **No `rustup update`, ever.** Every Rust release means repeating this.
 - **A build failure here is an LLVM/C++ link error**, not a Rust one. Expect to
   read linker output.
+
+
+## Result
+
+Built, self-hosted, and measured. `RUSTC_STAGE=2 ./build-rustc measure`:
+
+                            stock    this build
+    librustc_driver          79.2         149.0
+    libLLVM.dylib           133.1     -- static
+                           ------        ------
+                            212.3         149.0    -30%
+
+**The compiler and its LLVM went from 212.3 MB to 149.0 MB.** The static link
+resolved from rustc's own LLVM roots and took roughly 70 MB where the shared
+library cost 133 MB. ORC, CodeView, PDB and the object-format readers never
+came along, exactly as predicted.
+
+### It is a real, self-hosting compiler
+
+stage2 is the stage1 compiler compiling the whole compiler again, and it lands
+on the same size:
+
+    stage1   156,281,896 bytes
+    stage2   156,253,096 bytes    (-28,800, 0.02%)
+
+That 0.02% is crate hashes and stage1-vs-stage0 codegen, not drift. Both stages
+compile and run programs, pass threaded/panicking/unwinding tests, and emit
+real arm64 Mach-O objects.
+
+### Backends
+
+    aarch64, x86_64, i686        can emit
+    riscv64, wasm32, loongarch,
+    armv7, powerpc64, s390x,
+    nvptx                        no backend
+
+Note `--print target-list` still names all 330 targets — those specs are
+unconditional Rust data. The failure moves to codegen: a dropped target dies
+with `could not create LLVM TargetMachine`, whereas x86_64 gets *past* that and
+only trips on a missing `core`, because std was built for aarch64 only.
+
+### What did not move, as promised
+
+std came out 128.9 -> 111.9 MB, but **that is not an LLVM saving** — it is
+`rust.debug = false` leaving `debuginfo-level-std` at 0. Measured effect on
+backtraces: inlined and generic std code still reports line numbers (it is
+codegen'd into the user's crate), while precompiled non-generic std frames lose
+them. Set `debuginfo-level-std = 1` to get it back at the cost of the 17 MB.
+
+Tree totals (419.4 vs 273.8 MB) are **not** like for like: stock carries cargo
+and rust-analyzer, this build carries rustdoc and no cargo. The 30% above is
+the honest figure.
+
+### What it cost to get here
+
+Four things, all now handled by `build-rustc` so a clean run reproduces them:
+
+- `codegen-tests = false` — FileCheck is not in the wasmer tarball at all.
+- `llvm-tools = false` — 14 LLVM binaries bootstrap would copy into the sysroot.
+- `llvm-config` wrapper — two targets, no libxml2, static zstd.
+- `--bindir` bridging — the pruned tree keeps binaries in `bin/`, not `usr/bin/`.
+
+The only genuine link failure was a missing system library, never an undefined
+LLVM symbol. The selective-linking premise was never in doubt once it built.
