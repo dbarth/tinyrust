@@ -354,3 +354,60 @@ Left on the table, with what each costs:
 
 The honest summary: after the strip, rustc and std are within 4 MB of each
 other, and 89% of std is metadata nobody can remove. The cheap wins are gone.
+
+
+## Fat LTO: measured, and kept
+
+`rust.lto` governs how **rustc itself** is compiled. It does not change the
+binaries rustc emits -- users get LTO from their own `-C lto`, which already
+works here (-13.4%, against stock's -13.1%). There is no channel by which a
+more-optimised compiler produces better output.
+
+    librustc_driver, unstripped   149.0 -> 131.6 MB   -11.7%
+    librustc_driver, stripped     115.4 -> 110.3 MB    -4.4%  (-5.1 MB)
+    build time (stage2)            4:08 -> 11:23       2.75x
+
+    type-check only (5401 lines)   0.90 -> 0.81 s     10% faster
+    full -O codegen (1803 lines)   5.79 -> 5.74 s     noise
+
+Most of the unstripped 17.4 MB gain was symbol table that `strip` removes
+anyway, which is why the two size rows disagree so much. The speed split is the
+same story as the size: fat LTO optimises rustc's Rust half, so type-checking
+gains 10% while codegen-dominated work -- where LLVM's C++ runs -- does not
+move. `cargo check`-shaped workloads are where this shows up.
+
+Kept as the default. The build is rare; the compiler is used constantly.
+
+## Where it ends
+
+    bucket     stock          this build
+    rustc      212.7 MB       110.3 MB
+    std        128.9 MB       111.7 MB
+    tools       77.2 MB            --
+    -------------------------------------
+    total      419.4 MB       222.0 MB
+
+    rustc + std   341.6 -> 222.0 MB   -35%
+    rustc alone   212.3 -> 110.3 MB   -48%
+    vs rustup's documented 1.4 GB     -84%
+
+### Two things not worth doing
+
+**Stripping std.** Would need `rust-objcopy` as a build dependency. Measured on
+a snapshot sysroot: `libstd.rlib` 3.10 -> 3.03 MB, all 26 rlibs unchanged at
+10.14 MB -- roughly 0.2 MB total, because std rlibs are ~70% LTO bitcode, which
+`strip` does not touch, and they already carry no debuginfo. It would not break
+linking (`strip -x` leaves 841 global symbols), but those globals are what
+symbolicate std frames in user backtraces. Bad trade.
+
+**Downgrading LLVM for Apple tooling.** Apple `nm` cannot read our rlib
+intermediates -- `Unknown attribute kind (105) (Producer: 'LLVM22.1.8', Reader:
+'LLVM APPLE_1_2100.0.123.102_0')` -- because those objects embed LLVM 22
+bitcode. Final executables and dylibs are fine with Apple `nm`, `otool` and
+`strip`; only intermediates fail. Apple clang here is 21.0.0 and rust 1.98
+demands `>=21`, so LLVM 21.x is the one version satisfying both, and wasmer's
+11.x-20.x builds are unusable. Not worth it: 22.1.8 is the version rust 1.98 is
+developed against, and dropping to 21 takes the fallback side of 13
+`LLVM_VERSION_GE(22, 0)` branches. The one case that would justify it is
+`-C linker-plugin-lto`, which hands bitcode to the *system* linker and would hit
+the same parse error.

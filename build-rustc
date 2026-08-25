@@ -29,6 +29,14 @@ TARGETS="${RUSTC_TARGETS:-aarch64-apple-darwin x86_64-apple-darwin}"
 # built by stage1 -- the compiler compiling itself -- and is what a real
 # distribution ships.
 STAGE="${RUSTC_STAGE:-1}"
+# LTO mode for compiling rustc itself: thin-local (rust's default, LTO within
+# each crate), thin, fat, or off. This changes the compiler, not the binaries
+# the compiler produces -- users get LTO from their own -C lto.
+# off | thin-local (rust's default) | thin | fat, in increasing order of scope.
+# fat measured -5.1 MB on the stripped compiler and ~10% faster type-checking
+# but at 2.75x the build time (4:08 -> 11:23), so the default is left alone for
+# iteration. Set RUSTC_LTO=fat for a release build.
+LTO="${RUSTC_LTO:-}"
 
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -118,7 +126,7 @@ done)
 codegen-backends = ["llvm"]
 # Debug info in the compiler itself is worth tens of MB and nothing here reads
 # a rustc backtrace.
-debug = false
+debug = false${LTO:+$(printf '\nlto = "%s"' "$LTO")}
 # These need LLVM's FileCheck, a test-only binary the pruned ./llvm does not
 # have. Nothing else in the build wants it.
 codegen-tests = false
