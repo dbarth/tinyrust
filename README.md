@@ -139,6 +139,42 @@ gimli/addr2line/dwarf/backtrace, a 26 KB `__eh_frame` and a 4.6 KB
 can print a symbolised backtrace. You pay for it whether or not you ever panic.
 Drop std and you are within 17 KB of C.
 
+## Going below rustup, if it ever seems worth it
+
+`trustup` currently drives `rustup` and then deletes. It could fetch directly
+instead: the channel manifest is a plain TOML index with a URL and a SHA-256
+per component per target.
+
+    [pkg.rustc.target.aarch64-apple-darwin]
+    xz_url  = ".../rustc-1.98.0-aarch64-apple-darwin.tar.xz"
+    xz_hash = "287edbc2..."
+
+So an install is three URLs, streamed straight into place:
+
+    curl -sSL "$xz_url" | tee >(shasum -a 256) | tar -xJ --strip-components=2 -C "$dest" <paths>
+
+No TOML parser needed — the manifest is regular enough for
+`grep -A 6 '^\[pkg\.rustc\.target\.<triple>\]'`. `curl`, `shasum` and `tar`
+already handle TLS and `.tar.xz` on macOS, which is most of what the 11 MB
+`rustup` binary carries.
+
+**What it would buy:** file-level filtering *during* extraction, so the 43 MB
+`trim` deletes is never written; 11 MB for `rustup` itself, whose `bin/`
+entries are all symlinks to one binary that re-execs the real one.
+
+**What it would not buy: a single byte less downloaded.** Components ship as
+whole tarballs, and `rustdoc` is *inside* the rustc component — its install
+manifest lists 43 files including `bin/rustdoc`. There is no rustc-without-
+rustdoc to fetch. The 893 MB of docs is already avoided, because `rust-docs` is
+its own package that `--profile minimal` never requests.
+
+**What it would cost:** `rustup update`, multiple toolchains, `+nightly`, and
+the proxy shims. For a pinned single-purpose toolchain, none of that is used.
+
+Deliberately a shell script until the install is understood well enough to be
+worth rewriting; `rustup` itself is a Rust binary, and that is the obvious
+endpoint, not the starting one.
+
 ## Not done
 
 - No `nightly`, no components beyond the three.
