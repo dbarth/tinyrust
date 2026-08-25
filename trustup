@@ -338,8 +338,10 @@ link_into_path() {
   # trustup installs itself into the toolchain it manages. The links below then
   # point at that copy, so they survive the checkout being moved or deleted and
   # do not depend on where the install was run from -- local or fetched.
+  # $0 may be the ~/.cargo/bin/rustup symlink pointing at the copy we are about
+  # to write, so compare inodes rather than paths.
   local self; self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-  if [ "$self" != "$p/bin/trustup" ]; then
+  if ! [ "$self" -ef "$p/bin/trustup" ]; then
     install -m 755 "$self" "$p/bin/trustup"
   fi
   # rustup owns cargo/rustc/rustdoc shims in this same directory. Replacing
