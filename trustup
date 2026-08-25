@@ -10,6 +10,10 @@
 #   trustup component add N   add one
 #   trustup size              where the bytes are
 #   trustup env               shell lines to use it
+#   trustup <anything else>   passed through to rustup (--rustup installs only)
+#
+# TRUSTUP_DIST=file://.../dist TRUSTUP_CHANNEL=local installs a toolchain built
+# by ./build-rustc dist instead of the official one.
 #
 # Everything lives under one directory. Nothing touches ~/.rustup, ~/.cargo or
 # PATH -- `trustup env` prints what to source, and removing the directory
@@ -22,7 +26,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${TRUSTUP_ROOT:-$HERE/toolchain}"
 
 CHANNEL="${TRUSTUP_CHANNEL:-stable}"
-DIST="https://static.rust-lang.org/dist"
+# Point TRUSTUP_DIST at a directory of tarballs written by `build-rustc dist`
+# (a file:// URL works -- curl handles it) to install a locally built toolchain
+# instead of the official one. Same manifest format, same fetch path.
+DIST="${TRUSTUP_DIST:-https://static.rust-lang.org/dist}"
 
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -151,7 +158,12 @@ cmd_install_direct() {
   # is never even requested.
   local pkg
   for pkg in rustc rust-std cargo; do
-    fetch_component "$pkg" "$triple" "$mf" "$dest" "$work"
+    # Official tarballs carry things a build never opens, so they are pruned
+    # during extraction. A locally built one has already had everything
+    # unwanted left out -- pruning it again would delete rustdoc, which this
+    # toolchain deliberately ships for doctests.
+    fetch_component "$pkg" "$triple" "$mf" "$dest" "$work" \
+      "$([ -n "${TRUSTUP_DIST:-}" ] && echo no || echo yes)"
   done
 
   # rust-objcopy lives in lib/rustlib/<triple>/bin and has an rpath of
@@ -216,6 +228,33 @@ cmd_trim() {
 #
 # `list` reads what the manifest offers for this target, which is what
 # `rustup component list` reports from the same data.
+# Everything trustup does not need to intercept goes to the real rustup, so it
+# is a drop-in rather than a subset. Only the verbs where tinyrust differs are
+# handled here: install (fetch tiny, prune, one directory), component (resolve
+# against the manifest without a package database), trim, size and env.
+#
+# A --rustup install has a real rustup under $ROOT/rustup. A direct install does
+# not, and cannot invent one, so the passthrough says so plainly instead of
+# failing with something obscure.
+passthrough() {
+  local verb="$1"; shift
+  if [ -x "$ROOT/cargo/bin/rustup" ]; then
+    export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
+    exec "$ROOT/cargo/bin/rustup" "$verb" "$@"
+  fi
+  cat >&2 <<EOF
+trustup: '$verb' is passed through to rustup, and this toolchain was installed
+without one. Either use it directly:
+
+  rustc, cargo and rustdoc are on PATH after: eval "\$($0 env)"
+
+or reinstall with rustup underneath, which keeps every rustup verb working:
+
+  $0 install --rustup
+EOF
+  exit 1
+}
+
 cmd_component() {
   local verb="${1:-list}"; shift || true
   case "$verb" in
@@ -318,5 +357,6 @@ case "${1:-}" in
   trim) cmd_trim ;;
   size) cmd_size ;;
   env)  cmd_env ;;
-  *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+  ""|-h|--help|help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) passthrough "$@" ;;
 esac
