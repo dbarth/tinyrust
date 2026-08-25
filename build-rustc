@@ -312,9 +312,13 @@ cmd_dist() {
   # rustc correctly, tested. This list is what trustup is allowed to fetch
   # upstream; anything else absent from this manifest is refused rather than
   # silently mixed.
+  # Only entries checked to carry no link to librustc_driver. rust-analyzer
+  # looks independent and is not: the toolchain build links librustc_driver for
+  # proc-macro expansion, so the official one dies with
+  #   dyld: Library not loaded: @rpath/librustc_driver-4031c0ff8e88f5d1.dylib
+  # against this compiler. trustup re-checks after fetching regardless.
   printf 'upstream-ok = ["cargo", "rust-docs", "rustc-docs", "rust-src", ' >> "$mf"
-  printf '"rust-analyzer-preview", "llvm-tools-preview", ' >> "$mf"
-  printf '"llvm-bitcode-linker-preview"]\n\n' >> "$mf"
+  printf '"llvm-tools-preview"]\n\n' >> "$mf"
 
   pack() { # pack <pkg> <triple> <files-relative-to-out...>
     local pkg="$1" tri="$2"; shift 2

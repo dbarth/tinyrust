@@ -239,6 +239,24 @@ cmd_trim() {
 # A --rustup install has a real rustup under $ROOT/rustup. A direct install does
 # not, and cannot invent one, so the passthrough says so plainly instead of
 # failing with something obscure.
+# The upstream-ok list is a claim, so check it rather than trust it: a
+# component that turns out to link librustc_driver was compiled against another
+# compiler and will die at exec with a dyld error. Caught here instead.
+upstream_is_independent() {
+  local pkg="$1" before="$2" after="$3" f bad=""
+  # Only what this component just unpacked. The toolchain's own rustc and
+  # rustdoc link librustc_driver by design and are not the question.
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    case "$(file -b "$f" 2>/dev/null)" in *Mach-O*) ;; *) continue ;; esac
+    otool -L "$f" 2>/dev/null | grep -q 'librustc_driver' && bad="$bad $(basename "$f")"
+  done < <(comm -13 "$before" "$after")
+  [ -z "$bad" ] && return 0
+  die "$pkg links librustc_driver ($bad ) and was built by a different rustc.
+       It is wrongly listed upstream-ok in this dist's manifest. Remove it, and
+       reinstall the toolchain to drop what was just unpacked."
+}
+
 passthrough() {
   local verb="$1"; shift
   ensure_rustup
@@ -325,7 +343,7 @@ INNER
   local omf="" pkg
   say "adding to $p"
   for pkg in "$@"; do
-    if grep -q "^\[pkg\.$pkg\.target\.$triple\]" "$mf"; then
+    if grep -qF "[pkg.$pkg.target.$triple]" "$mf"; then
       note "$pkg from $channel"
       fetch_component "$pkg" "$triple" "$mf" "$p" "$work" no
     elif [ "$DIST" != "https://static.rust-lang.org/dist" ] && \
@@ -335,9 +353,18 @@ INNER
         curl -sSfL -o "$omf" "https://static.rust-lang.org/dist/channel-rust-stable.toml" \
           || die "could not fetch the official manifest"
       fi
+      # Target-independent components (rust-src, the docs) are published under
+      # the literal target "*", not a triple.
+      # Target-independent components are keyed by the literal, quoted "*".
+      local key="$triple"
+      grep -qF "[pkg.$pkg.target.$triple]" "$omf" || key='"*"'
       note "$pkg from the official dist (compiler-independent)"
+      local b="$work/before.$pkg" a="$work/after.$pkg"
+      find "$p" -type f 2>/dev/null | sort > "$b"
       DIST=https://static.rust-lang.org/dist \
-        fetch_component "$pkg" "$triple" "$omf" "$p" "$work" no
+        fetch_component "$pkg" "$key" "$omf" "$p" "$work" no
+      find "$p" -type f 2>/dev/null | sort > "$a"
+      upstream_is_independent "$pkg" "$b" "$a"
     else
       die "$pkg is not in this dist, and is not safe to take from the official
        one: it links librustc_driver or loads crate metadata, and the official

@@ -135,14 +135,19 @@ Backends: x86, x86_64, aarch64. `llvm-config-lean` hides the rest from
 | | |
 |---|---|
 | in this dist | taken from it — `rustc`, `rust-std`, `cargo` |
-| declared `upstream-ok` | taken from the official dist — `rust-analyzer`, `rust-docs`, `rust-src`, `llvm-tools` |
-| anything else | refused — `clippy`, `rustfmt`, `miri` |
+| declared `upstream-ok` | taken from the official dist — `rust-docs`, `rust-src`, `llvm-tools` |
+| anything else | refused — `clippy`, `rustfmt`, `rust-analyzer`, `miri` |
 
 Rust writes the exact compiler version string into crate metadata, so anything
 that loads an `.rmeta` or links `librustc_driver` must be built by *this*
 compiler. Mixing gives `E0514: found crate std compiled by an incompatible
 version of rustc`. Everything else only runs rustc or carries no code — official
 cargo drives this rustc correctly.
+
+`rust-analyzer` looks independent and is not: the toolchain build links
+`librustc_driver` for proc-macro expansion. The list is therefore a claim, not a
+guarantee, so trustup re-checks each upstream component after unpacking it and
+refuses one that turns out to link the driver.
 
 ## No binary links outside the OS
 
