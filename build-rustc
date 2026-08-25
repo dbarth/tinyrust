@@ -19,6 +19,11 @@ SRC="$HERE/rust"
 # comparison is like for like. Its LLVM is 22.1.8, which is what ./llvm is.
 VERSION="${RUSTC_VERSION:-1.98.0}"
 TRIPLE="aarch64-apple-darwin"
+# std is built for each of these. The host stays aarch64 -- this is one
+# compiler that can also emit for x86_64, not two compilers. x86_64-apple-
+# darwin is the cheap second target: the macOS SDK is universal, so no cross
+# sysroot is needed. A Linux target would need one, plus a cross linker.
+TARGETS="${RUSTC_TARGETS:-aarch64-apple-darwin x86_64-apple-darwin}"
 # stage1 is built by the downloaded stage0 and is enough to measure. stage2 is
 # built by stage1 -- the compiler compiling itself -- and is what a real
 # distribution ships.
@@ -92,15 +97,20 @@ link-shared = false
 download-ci-llvm = false
 
 [build]
-target = ["$TRIPLE"]
+target = [$(for t in $TARGETS; do printf '"%s", ' "$t"; done | sed 's/, $//')]
 host = ["$TRIPLE"]
 # Nothing here needs the docs, and building them is a large part of a full
 # bootstrap.
 docs = false
 extended = false
 
-[target.$TRIPLE]
+$(for t in $TARGETS; do
+cat <<TGT
+[target.$t]
 llvm-config = "$LLVM/bin/llvm-config"
+
+TGT
+done)
 
 [rust]
 # LLVM is special and is always built and distributed; this is not a choice.
@@ -134,7 +144,11 @@ cmd_build() {
   note "system-libs  $("$LLVM/bin/llvm-config" --system-libs --link-static)"
 
   say "building stage$STAGE"
-  ( cd "$SRC" && ./x build --stage "$STAGE" )
+  # `compiler library` rather than a bare `./x build`: the default step set
+  # also builds rustdoc, and `tools = []` does not suppress it. The toolchain
+  # we measure against is rustc + rust-std + cargo with no rustdoc, so leaving
+  # it unbuilt is what makes the comparison like for like.
+  ( cd "$SRC" && ./x build --stage "$STAGE" compiler library )
   say "built"
   note "stage$STAGE at $SRC/build/$TRIPLE/stage$STAGE"
 }
@@ -142,59 +156,78 @@ cmd_build() {
 cmd_measure() {
   local out="$SRC/build/$TRIPLE/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
-  say "stage$STAGE"; echo
   local stock="$HERE/toolchain/rust-stable"
 
-  # Sizes in MB. b() sums files, d() sums a directory.
   b() { local t=0 f; for f in "$@"; do [ -f "$f" ] && t=$((t+$(stat -f%z "$f"))); done
         awk -v t=$t 'BEGIN{printf "%.1f", t/1048576}'; }
-  d() { du -sk "$@" 2>/dev/null | awk '{t+=$1} END{printf "%.1f", t/1024}'; }
+  k() { du -sk "$@" 2>/dev/null | awk '{t+=$1} END{print t+0}'; }
+  # k() of a tree, minus the k() of each path after it.
+  minus() { local root=$1; shift; local t; t=$(k "$root"); local p
+            for p in "$@"; do [ -e "$p" ] && t=$((t - $(k "$p"))); done
+            awk -v t=$t 'BEGIN{printf "%.1f", t/1024}'; }
+  pct() { awk -v a=$1 -v b=$2 'BEGIN{printf "%+.0f%%", (b-a)*100/a}'; }
 
-  local o_drv s_drv s_llvm o_std s_std
+  say "stage$STAGE"; echo
+
+  local o_drv s_drv s_llvm
   o_drv=$(b "$out"/lib/librustc_driver-*.dylib)
   s_drv=$(b "$stock"/lib/librustc_driver-*.dylib)
-  # The copy under rustlib/ is a symlink to this one; count it once.
-  s_llvm=$(b "$stock"/lib/libLLVM.dylib)
-  o_std=$(d "$out/lib/rustlib/$TRIPLE/lib")
-  s_std=$(d "$stock/lib/rustlib/$TRIPLE/lib")
+  s_llvm=$(b "$stock"/lib/libLLVM.dylib)   # the rustlib copy is a symlink to this
 
   say "the compiler, and the LLVM inside it"
-  printf '  %-26s %8s %9s\n' "" stock "this build"
-  printf '  %-26s %8s %9s\n' "librustc_driver" "$s_drv" "$o_drv"
-  printf '  %-26s %8s %9s\n' "libLLVM.dylib" "$s_llvm" "-- static"
-  printf '  %-26s %8s %9s   %s\n' "" "$(awk -v a=$s_drv -v b=$s_llvm 'BEGIN{printf "%.1f", a+b}')" "$o_drv" \
-    "$(awk -v a=$s_drv -v b=$s_llvm -v c=$o_drv 'BEGIN{printf "%+.0f%%", (c-(a+b))*100/(a+b)}')"
-  echo
-  note "This is the number the exercise is about. The rest is unaffected by"
-  note "any LLVM work, exactly as PLAN-rustc.md predicted."
+  printf '  %-30s %8s %11s\n' "" stock "this build"
+  printf '  %-30s %8s %11s\n' "librustc_driver" "$s_drv" "$o_drv"
+  printf '  %-30s %8s %11s\n' "libLLVM.dylib" "$s_llvm" "-- static"
+  printf '  %-30s %8s %11s   %s\n' "" \
+    "$(awk -v a=$s_drv -v b=$s_llvm 'BEGIN{printf "%.1f", a+b}')" "$o_drv" \
+    "$(pct "$(awk -v a=$s_drv -v b=$s_llvm 'BEGIN{print a+b}')" "$o_drv")"
   echo
 
-  say "std"
-  printf '  %-26s %8s %9s   %s\n' "rustlib/$TRIPLE/lib" "$s_std" "$o_std" \
-    "$(awk -v a=$s_std -v b=$o_std 'BEGIN{printf "%+.0f%%", (b-a)*100/a}')"
-  note "Not an LLVM saving: rust.debug = false leaves debuginfo-level-std at 0,"
-  note "so these rlibs ship without debug info while the stock ones carry it."
+  say "std, per target"
+  local t
+  for t in $TARGETS; do
+    printf '  %-30s %8s %11s\n' "$t" \
+      "$([ -d "$stock/lib/rustlib/$t/lib" ] && minus "$stock/lib/rustlib/$t/lib" || echo "--")" \
+      "$([ -d "$out/lib/rustlib/$t/lib" ] && minus "$out/lib/rustlib/$t/lib" || echo "--")"
+  done
+  note "stock ships one target; this build ships $(set -- $TARGETS; echo $#)."
+  note "Not an LLVM saving either way: rust.debug = false leaves"
+  note "debuginfo-level-std at 0, so these rlibs carry no debug info."
+  echo
+
+  # Everything that is not a compiler: the comparison is meaningless without
+  # taking these out, since each tree has a different set of them.
+  local s_ex="$stock/bin/cargo $stock/bin/rust-analyzer $stock/bin/rust-gdb
+              $stock/bin/rust-gdbgui $stock/bin/rust-lldb $stock/libexec
+              $stock/share $stock/etc $stock/manifest.in"
+  local o_ex="$out/bin/rustdoc"
+
+  say "like for like -- rustc and std only"
+  note "out of stock: cargo, rust-analyzer, rust-gdb/gdbgui/lldb, libexec, share, etc"
+  note "out of this build: rustdoc$([ -e "$out/bin/rustdoc" ] || echo ' (not built)')"
+  echo
+  local s_tot o_one o_all
+  s_tot=$(minus "$stock" $s_ex)
+  o_all=$(minus "$out" $o_ex)
+  # Same capability as stock, i.e. counting only the host target's std.
+  o_one=$(minus "$out" $o_ex $(for t in $TARGETS; do
+            [ "$t" = "$TRIPLE" ] || echo "$out/lib/rustlib/$t"; done))
+  printf '  %-30s %8s\n' "stock (1 std target)" "$s_tot"
+  printf '  %-30s %8s   %s\n' "this build (1 std target)" "$o_one" "$(pct "$s_tot" "$o_one")"
+  printf '  %-30s %8s   %s\n' "this build (all $(set -- $TARGETS; echo $#) std targets)" "$o_all" "$(pct "$s_tot" "$o_all")"
   echo
 
   say "backends linked in"
-  "$out/bin/rustc" --print target-list >/dev/null 2>&1 &&
-    note "target-list still names $("$out/bin/rustc" --print target-list | wc -l | tr -d ' ') targets -- those specs are unconditional"
-  local t
-  for t in aarch64-apple-darwin x86_64-unknown-linux-gnu riscv64gc-unknown-linux-gnu \
-           wasm32-unknown-unknown armv7-unknown-linux-gnueabihf; do
+  note "target-list still names $("$out/bin/rustc" --print target-list | wc -l | tr -d ' ') targets -- those specs are unconditional"
+  for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu \
+           riscv64gc-unknown-linux-gnu wasm32-unknown-unknown armv7-unknown-linux-gnueabihf; do
     if "$out/bin/rustc" --print target-cpus --target "$t" >/dev/null 2>&1; then
-      printf '  %-34s can emit\n' "$t"
+      printf '  %-34s can emit%s\n' "$t" \
+        "$([ -d "$out/lib/rustlib/$t/lib" ] && echo '   + std')"
     else
       printf '  %-34s no backend\n' "$t"
     fi
   done
-  echo
-
-  say "trees"
-  printf '  %-26s %8s %9s\n' "total" "$(d "$stock")" "$(d "$out")"
-  note "Not like for like: stock adds cargo ($(b "$stock/bin/cargo") MB) and"
-  note "rust-analyzer ($(b "$stock/bin/rust-analyzer") MB); this build adds rustdoc ($(b "$out/bin/rustdoc") MB)"
-  note "and no cargo. Compare the first table, not this one."
 }
 
 case "${1:-}" in

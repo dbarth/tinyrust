@@ -242,3 +242,43 @@ Four things, all now handled by `build-rustc` so a clean run reproduces them:
 
 The only genuine link failure was a missing system library, never an undefined
 LLVM symbol. The selective-linking premise was never in doubt once it built.
+
+
+## Second pass: x86_64 std, and an even comparison
+
+### std for a second target is a second directory, not a second file
+
+Adding `x86_64-apple-darwin` to `build.target` gives a *host* compiler that is
+still aarch64-only; what appears is a parallel sysroot directory:
+
+    lib/rustlib/aarch64-apple-darwin/lib   111.9 MB   26 rlibs
+    lib/rustlib/x86_64-apple-darwin/lib    114.1 MB   26 rlibs
+
+Same 26 crates, compiled again for the other architecture. Verified end to end:
+`--target x86_64-apple-darwin` now produces a real `Mach-O 64-bit executable
+x86_64` that runs and prints the right answer, rather than stopping at
+`can't find crate for core`.
+
+x86_64-apple-darwin is the cheap second target because the macOS SDK is
+universal, so no cross sysroot is needed. `x86_64-unknown-linux-gnu` would need
+one, plus a cross linker — the backend is already there either way.
+
+### Making the two toolchains comparable
+
+The trees were never like for like: stock carries cargo and rust-analyzer, and
+`./x build` was producing a rustdoc that stock does not have. `tools = []` does
+**not** suppress rustdoc — it is a default step of `./x build`, not an entry in
+that list. Building `compiler library` instead leaves it out.
+
+`build-rustc measure` now subtracts everything that is not a compiler and says
+so: out of stock go cargo, rust-analyzer, the gdb/lldb wrappers, `libexec`,
+`share` and `etc`; out of this build goes rustdoc, which is no longer built.
+
+    stock (1 std target)              348.8 MB
+    this build (1 std target)         261.0 MB    -25%
+    this build (2 std targets)        375.1 MB     +8%
+
+**−25% at equal capability.** The +8% row is the honest cost of the second
+target: this build is *larger* than stock overall, and buys cross-compilation
+to x86_64 for it. Which row matters depends on whether the second std is
+wanted; both are printed so neither can be quoted alone.
