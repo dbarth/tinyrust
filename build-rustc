@@ -198,6 +198,7 @@ cmd_build() {
   # Bootstrap leaves tools in stage<N>-tools-bin; only `./x install` moves them
   # into the sysroot. Place them so the tree is a usable toolchain as built.
   local tb="$SRC/build/$TRIPLE/stage$STAGE-tools-bin" t src
+  local out_bin="$SRC/build/$TRIPLE/stage$STAGE/bin"
   for t in $TOOLS; do
     # bootstrap calls rustdoc's binary rustdoc_tool_binary in the tools dir.
     case "$t" in rustdoc) src="$tb/rustdoc_tool_binary" ;; *) src="$tb/$t" ;; esac
@@ -214,6 +215,20 @@ cmd_build() {
     else
       note "WARNING: $t not found at $src"
     fi
+  done
+
+  # Bootstrap hardlinks some optional tools straight into the sysroot. They are
+  # components a user adds, not part of a default install, and leaving them
+  # there both inflates the install and ships them to people who did not ask.
+  # dist packs them from stage<N>-tools-bin, which is untouched by this.
+  local opt
+  for opt in $TOOLS_OPTIONAL; do
+    case "$opt" in
+      clippy)        rm -f "$out_bin"/cargo-clippy "$out_bin"/clippy-driver ;;
+      rustfmt)       rm -f "$out_bin"/rustfmt "$out_bin"/cargo-fmt ;;
+      rust-analyzer) rm -f "$out_bin"/rust-analyzer ;;
+      miri)          rm -f "$out_bin"/miri "$out_bin"/cargo-miri ;;
+    esac
   done
 
   say "built"
@@ -296,6 +311,17 @@ cmd_trim() {
 cmd_dist() {
   local out="$SRC/build/$TRIPLE/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
+  # Published artifacts are always the fat-LTO build: it is worth 15.3 MB
+  # across the tools and 5.1 MB on the compiler, and nobody downloading a
+  # release cares that it took 13 minutes instead of 5. dist packages what is
+  # already built, so refuse rather than quietly ship a thin-local tree.
+  grep -q '^lto = "fat"' "$SRC/bootstrap.toml" 2>/dev/null || die \
+"this tree was not built with fat LTO, and release artifacts should be.
+
+  RUSTC_LTO=fat $0 configure
+  RUSTC_LTO=fat RUSTC_STAGE=$STAGE $0 build
+  $0 trim && $0 strip && RUSTC_LTO=fat $0 dist"
+
   local dist="$HERE/dist" chan=local
   rm -rf "$dist"; mkdir -p "$dist"
 
