@@ -46,11 +46,14 @@ LLVM_TOOLS="${RUSTC_LLVM_TOOLS:-true}"
 # Tools to build alongside the compiler. cargo is the only one that changes
 # what the toolchain can do -- without it there is no dependency resolution
 # and no build graph, only hand-compiled single files.
-# rustdoc is not optional in practice: it renders /// docs and, more
-# importantly, runs doctests, so `cargo test` on a library with doc examples
-# needs it. clippy and rustfmt are deliberately absent -- they are separate
-# rustup components a user can add, and neither affects what can be built.
+# cargo and rustdoc ship in every install: nothing else resolves dependencies,
+# and `cargo test` needs rustdoc for doctests.
 TOOLS="${RUSTC_TOOLS:-cargo rustdoc}"
+# Built and packaged, but not installed by default -- these are components a
+# user adds. They have to be built here rather than taken from the official
+# dist because each links librustc_driver, so the official build of them is
+# tied to the official compiler. See PLAN-rustc.md.
+TOOLS_OPTIONAL="${RUSTC_TOOLS_OPTIONAL:-clippy rustfmt rust-analyzer miri}"
 # Of the 14 binaries in the llvm-tools component (205 MB), these are kept.
 # cargo shells out to rust-objcopy to honour `strip` in release profiles.
 # Add llvm-profdata and llvm-cov if you want -C instrument-coverage to be
@@ -191,7 +194,7 @@ cmd_build() {
   # also builds rustdoc, and `tools = []` does not suppress it. The toolchain
   # we measure against is rustc + rust-std + cargo with no rustdoc, so leaving
   # it unbuilt is what makes the comparison like for like.
-  ( cd "$SRC" && ./x build --stage "$STAGE" compiler library $TOOLS )
+  ( cd "$SRC" && ./x build --stage "$STAGE" compiler library $TOOLS $TOOLS_OPTIONAL )
   # Bootstrap leaves tools in stage<N>-tools-bin; only `./x install` moves them
   # into the sysroot. Place them so the tree is a usable toolchain as built.
   local tb="$SRC/build/$TRIPLE/stage$STAGE-tools-bin" t src
@@ -231,7 +234,10 @@ cmd_strip() {
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
   local f before after
   # rust-objcopy comes from ./llvm already stripped, so it is not listed.
-  for f in "$out"/lib/librustc_driver-*.dylib "$out"/bin/*; do
+  # stage<N>-tools-bin is where the optional tools live and where dist packs
+  # them from, so they have to be stripped there too.
+  for f in "$out"/lib/librustc_driver-*.dylib "$out"/bin/* \
+           "$SRC/build/$TRIPLE/stage$STAGE-tools-bin"/*; do
     [ -f "$f" ] || continue
     before=$(stat -f%z "$f")
     # -x removes local symbols and keeps exported ones, which is what a dylib
@@ -320,16 +326,17 @@ cmd_dist() {
   printf 'upstream-ok = ["cargo", "rust-docs", "rustc-docs", "rust-src", ' >> "$mf"
   printf '"llvm-tools-preview"]\n\n' >> "$mf"
 
-  pack() { # pack <pkg> <triple> <files-relative-to-out...>
+  pack() { # pack <pkg> <triple> <files...>   (relative to $PACK_FROM)
     local pkg="$1" tri="$2"; shift 2
+    local from="${PACK_FROM:-$out}"
     local stem="$pkg-$VERSION-$tri"
     local stage="$dist/.stage/$stem/$pkg"
     rm -rf "$dist/.stage"; mkdir -p "$stage"
     local f
     for f in "$@"; do
-      [ -e "$out/$f" ] || continue
+      [ -e "$from/$f" ] || continue
       mkdir -p "$stage/$(dirname "$f")"
-      cp -R "$out/$f" "$stage/$(dirname "$f")/"
+      cp -R "$from/$f" "$stage/$(dirname "$f")/"
     done
     ( cd "$dist/.stage" && tar cf - "$stem" ) | xz -9 -T0 > "$dist/$stem.tar.xz"
     rm -rf "$dist/.stage"
@@ -354,6 +361,39 @@ TOML
   done
   pack rustc "$TRIPLE" $rustc_files
   pack cargo "$TRIPLE" bin/cargo
+
+  # The optional tools, each its own component under the name rustup uses, so
+  # `trustup component add clippy-preview` finds it where it expects to.
+  # Bootstrap leaves these in stage<N>-tools-bin flat; the component tarball
+  # has to put them where the sysroot expects, so each is staged by hand.
+  local tb="$SRC/build/$TRIPLE/stage$STAGE-tools-bin"
+  local comp bins have f
+  for comp in $TOOLS_OPTIONAL; do
+    case "$comp" in
+      clippy)        bins="cargo-clippy clippy-driver"; comp=clippy-preview ;;
+      rustfmt)       bins="rustfmt cargo-fmt";          comp=rustfmt-preview ;;
+      rust-analyzer) bins="rust-analyzer";              comp=rust-analyzer-preview ;;
+      miri)          bins="miri cargo-miri";            comp=miri ;;
+      *)             bins="$comp" ;;
+    esac
+    rm -rf "$dist/.tools"; mkdir -p "$dist/.tools/bin"
+    have=""
+    for f in $bins; do
+      [ -f "$tb/$f" ] && { cp "$tb/$f" "$dist/.tools/bin/$f"; have="$have bin/$f"; }
+    done
+    # rust-analyzer's proc-macro server lives in libexec, beside the binary.
+    if [ "$comp" = rust-analyzer-preview ] && [ -f "$tb/rust-analyzer-proc-macro-srv" ]; then
+      mkdir -p "$dist/.tools/libexec"
+      cp "$tb/rust-analyzer-proc-macro-srv" "$dist/.tools/libexec/"
+      have="$have libexec/rust-analyzer-proc-macro-srv"
+    fi
+    if [ -n "$have" ]; then
+      PACK_FROM="$dist/.tools" pack "$comp" "$TRIPLE" $have
+    else
+      note "$comp not built -- skipped"
+    fi
+    rm -rf "$dist/.tools"
+  done
   # One rust-std per target, each keyed by its own triple. trustup installs the
   # host's; the others are there for a later `target add` and are not fetched
   # by default.
