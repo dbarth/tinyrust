@@ -268,6 +268,22 @@ upstream_is_independent() {
        reinstall the toolchain to drop what was just unpacked."
 }
 
+# Invoked as `rustup` this must not pretend to be rustup. Say what it is, what
+# toolchain it manages, and how to get the real thing.
+cmd_identity() {
+  local p; p="$(prefix 2>/dev/null || true)"
+  say "trustup -- a thin rustup wrapper, installing a tinyrust toolchain"
+  if [ -n "$p" ] && [ -x "$p/bin/rustc" ]; then
+    note "toolchain  $("$p/bin/rustc" --version 2>/dev/null) at $p"
+    note "size       $(mb "$p") MB"
+  else
+    note "toolchain  none installed"
+  fi
+  note "this is not rustup. Commands it does not handle are passed through to"
+  note "the real one, fetched on demand. For the full official toolchain:"
+  note "  trustup install --rustup"
+}
+
 passthrough() {
   local verb="$1"; shift
   ensure_rustup
@@ -302,15 +318,42 @@ ensure_rustup() {
 # shell profile, so `cargo` works in a new terminal. Same here, or the toolchain
 # is invisible until you remember to eval something. Symlinks, not copies: an
 # upgrade replaces the toolchain and the links keep pointing at it.
+# True when a path exists and is not ours: either a real file, or a symlink
+# pointing somewhere other than this toolchain or this trustup.
+claimed() {
+  local target="$1" p="$2" dest
+  [ -e "$target" ] || [ -L "$target" ] || return 1
+  [ -L "$target" ] || return 0
+  dest="$(readlink "$target")"
+  case "$dest" in "$p"/*|"$HERE/trustup") return 1 ;; *) return 0 ;; esac
+}
+
 link_into_path() {
   local p="$1" f base
   mkdir -p "$CARGO_BIN"
+  # rustup owns cargo/rustc/rustdoc shims in this same directory. Replacing
+  # them would silently repoint somebody's existing toolchain at ours, so a
+  # name that is already taken by something that is not one of our symlinks is
+  # left alone.
   for f in "$p"/bin/*; do
     [ -x "$f" ] || continue
     base="$(basename "$f")"
-    ln -sf "$f" "$CARGO_BIN/$base"
+    if claimed "$CARGO_BIN/$base" "$p"; then
+      note "left the existing $base in $CARGO_BIN alone"
+    else
+      ln -sf "$f" "$CARGO_BIN/$base"
+    fi
   done
-  ln -sf "$HERE/trustup" "$CARGO_BIN/trustup" 2>/dev/null || true
+  claimed "$CARGO_BIN/trustup" "$p" || ln -sf "$HERE/trustup" "$CARGO_BIN/trustup"
+
+  # `rustup` as an alias for trustup, so muscle memory and any script that
+  # calls rustup keep working. Never over a real rustup: if one is already
+  # there, that is somebody's toolchain manager and not ours to replace.
+  if claimed "$CARGO_BIN/rustup" "$p"; then
+    note "left the existing rustup in $CARGO_BIN alone -- use 'trustup'"
+  else
+    ln -sf "$HERE/trustup" "$CARGO_BIN/rustup"
+  fi
   note "linked into $CARGO_BIN"
 
   case ":$PATH:" in *":$CARGO_BIN:"*) return ;; esac
@@ -469,6 +512,7 @@ case "${1:-}" in
   trim) cmd_trim ;;
   size) cmd_size ;;
   env)  cmd_env ;;
-  ""|-h|--help|help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+  ""|-h|--help|help) cmd_identity; sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -V|--version|version) cmd_identity ;;
   *) passthrough "$@" ;;
 esac
