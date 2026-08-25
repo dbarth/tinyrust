@@ -1,36 +1,46 @@
 # tinyrust
 
-`rustup` installs **1.4 GB** by default. This installs **415 MB** that builds
+`rustup` installs **1.4 GB** by default. This installs **390 MB** that builds
 the same programs, and says exactly where the remaining bytes go and why they
 cannot leave.
 
-    ./trustup install     # minimal profile, host target only
-    ./trustup trim        # remove what a build never opens
-    ./trustup size        # where the bytes are
+    ./trustup install            # fetch the three components directly
+    ./trustup size               # where the bytes are
     eval "$(./trustup env)"
 
-Everything lands in `toolchain/` with its own `RUSTUP_HOME` and `CARGO_HOME`.
-Nothing touches `~/.rustup`, `~/.cargo` or `PATH`. `rm -rf toolchain` is the
-uninstaller.
+There is no `rustup` in the default path: `trustup` reads the channel manifest,
+downloads three tarballs, checks their SHA-256 and untars them. Everything lands
+in `toolchain/rust-stable/`; `rm -rf toolchain` is the uninstaller.
+
+`./trustup install --rustup` drives rustup instead and then `./trustup trim`
+deletes what it over-installed. Kept because it is the thing being measured
+against.
 
 ## What it saves
 
 | | |
 |---|---|
 | default `rustup` profile | 1.4 GB |
-| `--profile minimal` | 458 MB |
-| after `trustup trim` | **415 MB** |
+| `rustup --profile minimal` | 458 MB |
+| `--rustup` + `trim` | 415 MB |
+| **direct** | **390 MB** |
 
-Verified after trimming: `rustc` builds and runs a program, `cargo new` +
-`cargo build --release` builds and runs a crate.
+Verified: `rustc --print sysroot` is right, and `cargo new` + `cargo build
+--release` compiles and runs a crate with no warnings.
+
+The direct route wins the last 25 MB by never writing the files at all —
+`tar --exclude` during extraction rather than `rm` afterwards — and by not
+installing the 11 MB `rustup` binary, whose `bin/` entries are all symlinks back
+to it.
 
 **Almost all of the saving is one component.** `rust-docs` is **893 MB** of
 generated HTML — more than the compiler and the standard library together — and
 it is in the default profile. Everything else here is rounding.
 
-## What `trim` removes
+## What is skipped
 
-Measured on this machine, not guessed.
+Measured on this machine, not guessed. The direct install excludes these during
+untar; `trim` deletes them after a `--rustup` install.
 
 | | | why |
 |---|---|---|
@@ -139,45 +149,54 @@ gimli/addr2line/dwarf/backtrace, a 26 KB `__eh_frame` and a 4.6 KB
 can print a symbolised backtrace. You pay for it whether or not you ever panic.
 Drop std and you are within 17 KB of C.
 
-## Going below rustup, if it ever seems worth it
+## How the direct install works
 
-`trustup` currently drives `rustup` and then deletes. It could fetch directly
-instead: the channel manifest is a plain TOML index with a URL and a SHA-256
-per component per target.
+The channel manifest is a plain TOML index with a URL and a SHA-256 per
+component per target:
 
     [pkg.rustc.target.aarch64-apple-darwin]
     xz_url  = ".../rustc-1.98.0-aarch64-apple-darwin.tar.xz"
     xz_hash = "287edbc2..."
 
-So an install is three URLs, streamed straight into place:
+So an install is three URLs — `rustc`, `rust-std`, `cargo` — each downloaded,
+checksummed, and untarred with `--strip-components=2`, because the archives are
+`<pkg>-<version>-<triple>/<component>/<files>`. About 110 MB of `.tar.xz`.
 
-    curl -sSL "$xz_url" | tee >(shasum -a 256) | tar -xJ --strip-components=2 -C "$dest" <paths>
+No TOML parser: the entries are regular enough to find by string search.
+`curl`, `shasum` and `tar` cover TLS, verification and `.tar.xz` on macOS, which
+is most of what the 11 MB `rustup` binary carries.
 
-No TOML parser needed — the manifest is regular enough for
-`grep -A 6 '^\[pkg\.rustc\.target\.<triple>\]'`. `curl`, `shasum` and `tar`
-already handle TLS and `.tar.xz` on macOS, which is most of what the 11 MB
-`rustup` binary carries.
+**It does not download less.** Components ship as whole tarballs, and `rustdoc`
+is *inside* the rustc component — its install manifest lists 43 files including
+`bin/rustdoc`. There is no rustc-without-rustdoc to fetch. The 893 MB of docs is
+avoided either way, because `rust-docs` is a package of its own that neither
+route requests.
 
-**What it would buy:** file-level filtering *during* extraction, so the 43 MB
-`trim` deletes is never written; 11 MB for `rustup` itself, whose `bin/`
-entries are all symlinks to one binary that re-execs the real one.
+**What it gives up:** `rustup update`, multiple toolchains, `+nightly`, and the
+proxy shims. For a pinned single-purpose toolchain, none of that is used.
 
-**What it would not buy: a single byte less downloaded.** Components ship as
-whole tarballs, and `rustdoc` is *inside* the rustc component — its install
-manifest lists 43 files including `bin/rustdoc`. There is no rustc-without-
-rustdoc to fetch. The 893 MB of docs is already avoided, because `rust-docs` is
-its own package that `--profile minimal` never requests.
+### Two things rustup's installer does that a plain untar does not
 
-**What it would cost:** `rustup update`, multiple toolchains, `+nightly`, and
-the proxy shims. For a pinned single-purpose toolchain, none of that is used.
+Both found by the toolchain failing, not by reading:
 
-Deliberately a shell script until the install is understood well enough to be
-worth rewriting; `rustup` itself is a Rust binary, and that is the obvious
-endpoint, not the starting one.
+**The prefix must not be named after the host triple.** rustc finds its sysroot
+by walking up from its own path, with a special case for
+`<sysroot>/lib/rustlib/<triple>/bin/rustc`. A prefix called
+`aarch64-apple-darwin` trips that rule, the sysroot lands four directories too
+high, and every build fails with `can't find crate for std`. Hence
+`toolchain/rust-stable/`.
+
+**`rust-objcopy` needs a second path to `libLLVM.dylib`.** It sits in
+`lib/rustlib/<triple>/bin/` with an rpath of `@loader_path/../lib`, but the
+dylib ships in the prefix's own `lib/`. cargo calls it to strip release
+binaries, so without a relative symlink every `--release` build prints a dyld
+trace and a `SIGABRT`.
 
 ## Not done
 
-- No `nightly`, no components beyond the three.
-- `trim` is not idempotent-checked against a rustup update; rustup will happily
-  reinstall what was removed.
-- Nothing verifies the download beyond what `rustup-init.sh` does itself.
+- No `nightly`, no components beyond the three. `TRUSTUP_CHANNEL` picks the
+  channel but nothing has been tried but stable.
+- The direct route pins nothing: it takes whatever `channel-rust-stable.toml`
+  points at today, and re-running it later gets a different compiler.
+- No update path. Reinstalling is `rm -rf toolchain && ./trustup install`.
+- Only four host triples are recognised, and only macOS is tested.

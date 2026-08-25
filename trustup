@@ -3,8 +3,9 @@
 # trustup -- install the smallest Rust toolchain that still builds for THIS
 # machine, and nothing else.
 #
-#   trustup install [DIR]     install into DIR (default ./toolchain)
-#   trustup trim              remove what a build never reads
+#   trustup install [DIR]     fetch the three components directly (default)
+#   trustup install --rustup  drive rustup, then delete what it over-installed
+#   trustup trim              remove what a build never reads (--rustup only)
 #   trustup size              where the bytes are
 #   trustup env               shell lines to use it
 #
@@ -17,11 +18,13 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${TRUSTUP_ROOT:-$HERE/toolchain}"
-export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
-RUSTUP="$CARGO_HOME/bin/rustup"
+
+CHANNEL="${TRUSTUP_CHANNEL:-stable}"
+DIST="https://static.rust-lang.org/dist"
 
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
+die()  { printf 'trustup: %s\n' "$*" >&2; exit 1; }
 mb()   { du -sm "$@" 2>/dev/null | awk '{s+=$1} END {print s+0}'; }
 
 # The host triple, from the machine rather than from a guess. This is the whole
@@ -33,93 +36,202 @@ host_triple() {
     Darwin/x86_64) echo x86_64-apple-darwin ;;
     Linux/aarch64) echo aarch64-unknown-linux-gnu ;;
     Linux/x86_64)  echo x86_64-unknown-linux-gnu ;;
-    *) echo "trustup: unknown host $(uname -s)/$(uname -m)" >&2; exit 1 ;;
+    *) die "unknown host $(uname -s)/$(uname -m)" ;;
   esac
 }
 
-cmd_install() {
-  [ $# -eq 0 ] || ROOT="$1"
+# Files a build never opens, excluded during extraction so they are never
+# written at all. Each was measured; `trustup size` prints what is left.
+#
+# rustdoc and share/doc go because this installs a compiler, not a
+# documentation system. The sanitizer runtimes go because they are linked only
+# by -Zsanitizer, which is nightly-only. wasm-component-ld goes because it is
+# reachable only from a wasm target that is not installed.
+#
+# NOT excluded, and worth saying why: rust-lld is the default linker for some
+# targets and the fallback for others, and libcore's 61 MB .rmeta is the MIR
+# every generic instantiation is built from -- drop it and the first `Vec<T>`
+# anyone writes fails to compile.
+SKIP=(
+  --exclude '*/bin/rustdoc'
+  --exclude '*/share/doc'
+  --exclude '*/librustc-*_rt.*'
+  --exclude '*/bin/wasm-component-ld'
+)
+
+# ---- direct: three tarballs, no rustup ------------------------------------
+
+# One field out of the channel manifest. The file is a TOML index of every
+# component for every target; the entries are regular enough that a parser
+# would be ceremony.
+manifest_field() {
+  local pkg="$1" triple="$2" field="$3" mf="$4"
+  python3 - "$pkg" "$triple" "$field" "$mf" <<'PY'
+import re, sys
+pkg, triple, field, mf = sys.argv[1:5]
+s = open(mf, encoding="utf-8").read()
+head = f"[pkg.{pkg}.target.{triple}]"
+i = s.find(head)
+if i < 0:
+    sys.exit(f"trustup: {pkg} is not published for {triple}")
+body = s[i + len(head):]
+body = body[:body.find("\n[")]
+m = re.search(rf'{field} = "([^"]+)"', body)
+if not m:
+    sys.exit(f"trustup: no {field} for {pkg}/{triple}")
+print(m.group(1))
+PY
+}
+
+fetch_component() {
+  local pkg="$1" triple="$2" mf="$3" dest="$4" work="$5"
+  local url hash tarball got
+
+  url="$(manifest_field "$pkg" "$triple" xz_url "$mf")"
+  hash="$(manifest_field "$pkg" "$triple" xz_hash "$mf")"
+  tarball="$work/$(basename "$url")"
+
+  note "$pkg"
+  curl -sSfL -o "$tarball" "$url" || die "could not download $url"
+
+  # Verified here rather than trusted: this is the one thing rustup does that
+  # a plain download does not.
+  got="$(shasum -a 256 "$tarball" | cut -d' ' -f1)"
+  [ "$got" = "$hash" ] || die "$pkg checksum mismatch
+     expected $hash
+     got      $got"
+
+  # strip 2: the archive is <pkg>-<version>-<triple>/<component>/<files>, and
+  # only <files> belongs under the prefix.
+  tar -xJf "$tarball" -C "$dest" --strip-components=2 "${SKIP[@]}"
+  rm -f "$tarball"
+}
+
+cmd_install_direct() {
+  local triple; triple="$(host_triple)"
+  # NOT named after the triple. rustc finds its sysroot by walking up from its
+  # own path, and treats `<sysroot>/lib/rustlib/<triple>/bin/rustc` as a
+  # special case -- a prefix called `aarch64-apple-darwin` trips that rule and
+  # the sysroot lands four directories too high.
+  local dest="$ROOT/rust-$CHANNEL"
+  say "installing $CHANNEL for $triple into $dest"
+  mkdir -p "$dest"
+
+  local work; work="$(mktemp -d)"
+  trap 'rm -rf "$work"' RETURN
+
+  local mf="$work/channel.toml"
+  curl -sSfL -o "$mf" "$DIST/channel-rust-$CHANNEL.toml" \
+    || die "could not fetch the $CHANNEL manifest"
+  note "manifest $(mb "$mf") MB, dated $(sed -n 's/^date = "\(.*\)"/\1/p' "$mf" | head -1)"
+
+  # Three components, and there is no fourth worth having: rustc carries the
+  # compiler and its LLVM, rust-std the library for this target, cargo the
+  # build tool. rust-docs is a package of its own, which is why 893 MB of HTML
+  # is never even requested.
+  local pkg
+  for pkg in rustc rust-std cargo; do
+    fetch_component "$pkg" "$triple" "$mf" "$dest" "$work"
+  done
+
+  # rust-objcopy lives in lib/rustlib/<triple>/bin and has an rpath of
+  # @loader_path/../lib, but libLLVM.dylib ships in the prefix's own lib. cargo
+  # calls it to strip release binaries, so without this it warns on every build.
+  local tb
+  for tb in "$dest"/lib/rustlib/*/bin; do
+    [ -d "$tb" ] || continue
+    mkdir -p "$tb/../lib"
+    ln -sf ../../../libLLVM.dylib "$tb/../lib/libLLVM.dylib"
+  done
+
+  say "installed: $(mb "$dest") MB"
+  note "use it with: eval \"\$($0 env)\""
+}
+
+# ---- rustup: the old way, kept for comparison ------------------------------
+
+cmd_install_rustup() {
   export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
   local triple; triple="$(host_triple)"
-
-  say "installing for $triple into $ROOT"
+  say "installing via rustup for $triple into $ROOT"
   mkdir -p "$ROOT"
   local init="$ROOT/rustup-init.sh"
-  [ -f "$init" ] || curl -sSf https://sh.rustup.rs -o "$init"
+  [ -f "$init" ] || curl -sSfL "https://sh.rustup.rs" -o "$init"
 
-  # --profile minimal is the only knob that matters: it is rustc + cargo +
-  # rust-std and nothing else. The default profile adds rust-docs, which is
-  # 893 MB of generated HTML -- more than the compiler and the library put
-  # together.
+  # --profile minimal is the only knob that matters here: rustc + cargo +
+  # rust-std and nothing else. The default profile adds rust-docs.
   sh "$init" -y --no-modify-path --profile minimal \
-     --default-toolchain stable --default-host "$triple" >/dev/null
+     --default-toolchain "$CHANNEL" --default-host "$triple" >/dev/null
 
   note "installed: $(mb "$ROOT") MB"
   say "now run: $0 trim"
 }
 
-# Files a build never opens. Each is measured, not guessed -- `trustup size`
-# prints them before and after.
-#
-# rustdoc and share/doc go because this installs a compiler, not a
-# documentation system. The sanitizer runtimes go because they are only linked
-# by -Zsanitizer, which is nightly-only. wasm-component-ld goes because it is
-# reachable only from a wasm target that is not installed.
-#
-# NOT removed, and worth saying why: rust-lld is the default linker for some
-# targets and the fallback for others, and libcore's 61 MB .rmeta is the MIR
-# every generic instantiation is built from -- deleting it breaks the first
-# `Vec<T>` anyone writes.
+# Only meaningful after --rustup: the direct install never writes these.
 cmd_trim() {
-  local tc; tc="$(echo "$RUSTUP_HOME"/toolchains/*/)"
-  [ -d "$tc" ] || { echo "trustup: nothing installed -- run '$0 install'" >&2; exit 1; }
+  local tc; tc="$(echo "$ROOT"/rustup/toolchains/*/)"
+  [ -d "$tc" ] || die "trim applies to a --rustup install; the direct one skips these already"
   local before; before="$(mb "$ROOT")"
 
   say "trimming $tc"
-  local gone=0
-  for path in \
-      "$tc/bin/rustdoc" \
-      "$tc/share/doc" \
-      "$tc/lib/rustlib/"*/bin/wasm-component-ld
-  do
+  for path in "$tc/bin/rustdoc" "$tc/share/doc" \
+              "$tc/lib/rustlib/"*/bin/wasm-component-ld \
+              "$tc"/lib/librustc-*_rt.*; do
     [ -e "$path" ] || continue
     note "$(basename "$path") -- $(mb "$path") MB"
-    rm -rf "$path"; gone=1
+    rm -rf "$path"
   done
-  for san in "$tc"/lib/librustc-*_rt.*.dylib "$tc"/lib/librustc-*_rt.*.a; do
-    [ -e "$san" ] || continue
-    note "$(basename "$san") -- $(mb "$san") MB"
-    rm -f "$san"; gone=1
-  done
-  [ "$gone" = 1 ] || note "nothing left to trim"
-
   say "$before MB -> $(mb "$ROOT") MB"
 }
 
+# ---- looking at it ---------------------------------------------------------
+
+# Where the toolchain is, whichever way it was installed.
+prefix() {
+  local d
+  for d in "$ROOT"/rust-*; do
+    [ -x "$d/bin/rustc" ] && { echo "$d"; return; }
+  done
+  local tc; tc="$(echo "$ROOT"/rustup/toolchains/*/)"
+  [ -x "$tc/bin/rustc" ] && { echo "${tc%/}"; return; }
+  die "nothing installed -- run '$0 install'"
+}
+
 cmd_size() {
-  local tc; tc="$(echo "$RUSTUP_HOME"/toolchains/*/)"
-  [ -d "$tc" ] || { echo "trustup: nothing installed" >&2; exit 1; }
+  local p; p="$(prefix)"
   say "total: $(mb "$ROOT") MB"
   echo
   say "irreducible without building rustc from source"
-  du -sh "$tc/lib/libLLVM.dylib" "$tc"/lib/librustc_driver-*.dylib 2>/dev/null \
+  du -sh "$p/lib/libLLVM.dylib" "$p"/lib/librustc_driver-*.dylib 2>/dev/null \
     | sed 's|/.*/|  |'
-  du -sh "$tc/lib/rustlib/"*/lib 2>/dev/null | sed 's|/.*rustlib/|  std for |'
+  du -sh "$p/lib/rustlib/"*/lib 2>/dev/null | sed 's|/.*rustlib/|  std for |'
   echo
   say "the rest"
-  du -sh "$tc/bin" "$CARGO_HOME" 2>/dev/null | sed 's|/.*/|  |'
+  du -sh "$p/bin" 2>/dev/null | sed 's|/.*/|  |'
 }
 
 cmd_env() {
-  echo "export RUSTUP_HOME=\"$RUSTUP_HOME\""
-  echo "export CARGO_HOME=\"$CARGO_HOME\""
-  echo "export PATH=\"$CARGO_HOME/bin:\$PATH\""
+  local p; p="$(prefix)"
+  if [ -d "$ROOT/rustup" ]; then
+    echo "export RUSTUP_HOME=\"$ROOT/rustup\""
+    echo "export CARGO_HOME=\"$ROOT/cargo\""
+    echo "export PATH=\"$ROOT/cargo/bin:\$PATH\""
+  else
+    # No rustup, so no proxy shims: the binaries are on PATH directly, and
+    # cargo finds rustc there. CARGO_HOME is only where the registry cache and
+    # any `cargo install` binaries go.
+    echo "export CARGO_HOME=\"$ROOT/cargo-home\""
+    echo "export PATH=\"$p/bin:\$PATH\""
+  fi
 }
 
 case "${1:-}" in
-  install) shift; cmd_install "$@" ;;
-  trim)    cmd_trim ;;
-  size)    cmd_size ;;
-  env)     cmd_env ;;
-  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+  install)
+    shift
+    if [ "${1:-}" = "--rustup" ]; then shift; [ $# -eq 0 ] || ROOT="$1"; cmd_install_rustup
+    else [ $# -eq 0 ] || ROOT="$1"; cmd_install_direct; fi ;;
+  trim) cmd_trim ;;
+  size) cmd_size ;;
+  env)  cmd_env ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac
