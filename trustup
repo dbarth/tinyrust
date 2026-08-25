@@ -23,7 +23,13 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="${TRUSTUP_ROOT:-$HERE/toolchain}"
+# ~/.rustup is where a Rust toolchain belongs, and where rustup will look if it
+# ever turns up: a directory under toolchains/ is exactly what `rustup toolchain
+# link` points at. ~/.cargo is not ours to place -- cargo creates it for the
+# registry cache whatever we do -- but ~/.cargo/bin is the conventional place
+# for the binaries, so that is where they are linked.
+ROOT="${TRUSTUP_ROOT:-$HOME/.rustup}"
+CARGO_BIN="${TRUSTUP_CARGO_BIN:-$HOME/.cargo/bin}"
 
 # A local dist is always the "local" channel -- pointing TRUSTUP_DIST at a
 # directory is the whole switch, there is no second variable to set.
@@ -143,7 +149,12 @@ cmd_install_direct() {
   # own path, and treats `<sysroot>/lib/rustlib/<triple>/bin/rustc` as a
   # special case -- a prefix called `aarch64-apple-darwin` trips that rule and
   # the sysroot lands four directories too high.
-  local dest="$ROOT/rust-$CHANNEL"
+  # One name, whatever the channel -- the channel is recorded in
+  # .trustup-channel, and rust-<channel> was never a rustup convention anyway
+  # (rustup names toolchains <channel>-<triple>, under ~/.rustup/toolchains).
+  # rustup's own layout, so the two can coexist and `rustup default tinyrust`
+  # works once a rustup exists.
+  local dest="$ROOT/toolchains/tinyrust"
   say "installing $CHANNEL for $triple into $dest"
   mkdir -p "$dest"
 
@@ -180,8 +191,8 @@ cmd_install_direct() {
   done
 
   printf '%s\n' "$CHANNEL" > "$dest/.trustup-channel"
+  link_into_path "$dest"
   say "installed: $(mb "$dest") MB"
-  note "use it with: eval \"\$($0 env)\""
 }
 
 # ---- rustup: the old way, kept for comparison ------------------------------
@@ -287,6 +298,35 @@ ensure_rustup() {
   fi
 }
 
+# rustup drops its binaries in ~/.cargo/bin and appends that directory to the
+# shell profile, so `cargo` works in a new terminal. Same here, or the toolchain
+# is invisible until you remember to eval something. Symlinks, not copies: an
+# upgrade replaces the toolchain and the links keep pointing at it.
+link_into_path() {
+  local p="$1" f base
+  mkdir -p "$CARGO_BIN"
+  for f in "$p"/bin/*; do
+    [ -x "$f" ] || continue
+    base="$(basename "$f")"
+    ln -sf "$f" "$CARGO_BIN/$base"
+  done
+  ln -sf "$HERE/trustup" "$CARGO_BIN/trustup" 2>/dev/null || true
+  note "linked into $CARGO_BIN"
+
+  case ":$PATH:" in *":$CARGO_BIN:"*) return ;; esac
+  local line=". \"\$HOME/.cargo/env\""
+  printf '#!/bin/sh\ncase ":$PATH:" in *":%s:"*) ;; *) PATH="%s:$PATH"; export PATH ;; esac\n' \
+    "$CARGO_BIN" "$CARGO_BIN" > "$HOME/.cargo/env"
+  local rc
+  for rc in "$HOME/.zshenv" "$HOME/.bashrc" "$HOME/.profile"; do
+    [ -e "$rc" ] || continue
+    grep -qF '.cargo/env' "$rc" 2>/dev/null && continue
+    printf '\n%s\n' "$line" >> "$rc"
+    note "added $CARGO_BIN to $(basename "$rc")"
+  done
+  note "open a new shell, or: . \"\$HOME/.cargo/env\""
+}
+
 cmd_component() {
   local verb="${1:-list}"; shift || true
   case "$verb" in
@@ -371,6 +411,9 @@ INNER
        build of it was compiled by a different rustc. Build it with build-rustc."
     fi
   done
+  # A component that ships binaries is useless until they are on PATH, and
+  # install-time linking happened before this component existed.
+  link_into_path "$p"
   say "now: $(mb "$p") MB"
 }
 
@@ -379,7 +422,9 @@ INNER
 # Where the toolchain is, whichever way it was installed.
 prefix() {
   local d
-  for d in "$ROOT"/rust-*; do
+  # rust-* is the old layout, still recognised so an existing install keeps
+  # working after the rename.
+  for d in "$ROOT"/toolchains/tinyrust "$ROOT"/tinyrust "$ROOT"/rust-*; do
     [ -x "$d/bin/rustc" ] && { echo "$d"; return; }
   done
   local tc; tc="$(echo "$ROOT"/rustup/toolchains/*/)"
