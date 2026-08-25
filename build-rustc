@@ -298,7 +298,23 @@ cmd_dist() {
   printf 'manifest-version = "2"\n' >> "$mf"
   # trustup prints this when installing; the official manifest carries one.
   printf 'date = "%s"\n' "$(date -u +%Y-%m-%d)" >> "$mf"
-  printf 'version = "%s"\n\n' "$VERSION" >> "$mf"
+  printf 'version = "%s"\n' "$VERSION" >> "$mf"
+
+  # Rust encodes the exact compiler version string in crate metadata, so
+  # anything that loads an .rmeta or links librustc_driver has to have been
+  # built by *this* compiler:
+  #
+  #   $ our-rustc --sysroot <official toolchain> hello.rs
+  #   error[E0514]: found crate `std` compiled by an incompatible version of rustc
+  #
+  # Everything else is only a program that runs rustc, or inert content, and
+  # can come from the official dist unchanged -- official cargo drives this
+  # rustc correctly, tested. This list is what trustup is allowed to fetch
+  # upstream; anything else absent from this manifest is refused rather than
+  # silently mixed.
+  printf 'upstream-ok = ["cargo", "rust-docs", "rustc-docs", "rust-src", ' >> "$mf"
+  printf '"rust-analyzer-preview", "llvm-tools-preview", ' >> "$mf"
+  printf '"llvm-bitcode-linker-preview"]\n\n' >> "$mf"
 
   pack() { # pack <pkg> <triple> <files-relative-to-out...>
     local pkg="$1" tri="$2"; shift 2
@@ -321,8 +337,7 @@ xz_url = "file://$dist/$stem.tar.xz"
 xz_hash = "$hash"
 
 TOML
-    ls -l "$dist/$stem.tar.xz" | awk -v p="$pkg $tri" '{printf "  %-34s %6.1f MB
-", p, $5/1048576}'
+    ls -l "$dist/$stem.tar.xz" | awk -v p="$pkg $tri" '{printf "  %-34s %6.1f MB\n", p, $5/1048576}'
   }
 
   say "packaging stage$STAGE"
