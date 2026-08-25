@@ -1,29 +1,41 @@
 # tinyrust
 
-Tinyrust installs the smallest Rust environment. It helps you get started quickly with Rust,
-without the 1.4GB tax of a normal `rustup`.
+Tinyrust will install the smallest Rust environment on macOS.
 
-`trustup` is tiny-rustup: it replaces `rustup` and downloads packages rebuilt to
-be tiny by default. You still get the full rustup/cargo support. Just not
-1G of precompiled HTML you won't read, nor the rest of the kitchen sink the default
-distribution throws at you.
 
-Tinyrust is meant for application developers who need the essential.
-If you are a Rust language developer or need to build for targets other than aarch64 or x86-64,
-you can switch to the full distribution toolchain with:
+## Get it
+
+    curl -sSfL https://raw.githubusercontent.com/dbarth/tinyrust/master/install.sh | sh
+
+## Why tinyrust?
+
+The standard Rust distribution is a 1.4GB install, before you even start compiling and adding dependencies.
+
+Tinyrust brings that down to 262MB, an 81% reduction, to get started faster and leaner.
+
+You still get the full rustup/cargo support, so you can add components or
+dependencies as usual:
+
+    rustup component add rust-analyzer-preview
+    cargo add serde
+
+If you later need more build targets or different build options, you can easily switch to the fuller distribution toolchain with:
 
     trustup install --rustup
+
 
 ## Use it
 
     curl -sSfL https://raw.githubusercontent.com/dbarth/tinyrust/master/install.sh | sh
     cargo new hello && cd hello && cargo run --release
 
-No prompt: one profile, the small one. Goes to `~/.rustup/toolchains/tinyrust`,
-links into `~/.cargo/bin`, adds that to your shell profile. An existing rustup
-is never touched — its shims are left alone and you use `trustup` by name.
-
-`rustup` is aliased to `trustup` but does not pretend to be it:
+The installer fetches the optimized toolchain and sets up the environment for building.
+ - no prompt, one profile: the small one. 
+ - installs to `~/.rustup/toolchains/tinyrust`,
+ - links into `~/.cargo/bin`,
+ - adds that to your shell profile.
+ 
+It contains `trustup`, ie "tiny rustup". `rustup` is aliased to `trustup` but does not pretend to be it:
 
     $ rustup --version
     trustup -- a thin rustup wrapper, installing a tinyrust toolchain
@@ -32,31 +44,31 @@ is never touched — its shims are left alone and you use `trustup` by name.
       the real one, fetched on demand. For the full official toolchain:
         trustup install --rustup
 
+Note: an existing rustup is never touched — its shims are left alone and you use `trustup` by name.
+
 | | |
 |---|---|
 | `trustup install [DIR]` | fetch components, no rustup |
 | `trustup install --rustup` | drive rustup, then trim what it over-installed |
 | `trustup component list\|add` | resolve against the manifest |
 | `trustup size` | where the bytes are |
-| `trustup env` | shell lines to use it |
+| `trustup env` | shell lines to use it, if you skipped the profile edit |
 | anything else | passed to rustup, fetched on first use |
 
 `component add` resolves three ways and never mixes silently:
 
 | | |
 |---|---|
-| in this dist | `rustc`, `rust-std`, `cargo`, `clippy`, `rustfmt`, `rust-analyzer`, `miri` |
-| `upstream-ok` | official dist — `rust-docs`, `rust-src`, `llvm-tools` |
+| in this dist | `rustc`, `rust-std`, `cargo`, `clippy-preview`, `rustfmt-preview`, `rust-analyzer-preview`, `miri` |
+| `upstream-ok` | official dist — `rust-docs`, `rustc-docs`, `rust-src`, `llvm-tools-preview` |
 | anything else | refused |
 
-Rust writes the compiler version string into crate metadata, so anything loading
-an `.rmeta` or linking `librustc_driver` must be built by *this* compiler —
-mixing gives `E0514`. trustup re-checks each upstream component after unpacking.
+Rust writes the compiler version string into crate metadata: anything loading
+an `.rmeta` or linking `librustc_driver` must be built by *this* compiler (mixing gives `E0514`).
+trustup re-checks each upstream component after unpacking.
 
 
 ## The numbers
-
-If you want to try Rust with the standard toolchain, you need to install 1.4GB of software.
 
 Just for macOS aarch64, rustc 1.98.0, one std target:
 
@@ -80,10 +92,8 @@ Just for macOS aarch64, rustc 1.98.0, one std target:
     cargo          the build tool
     rust-objcopy   rustc needs it for `strip = true` release profiles
 
-That is the whole default install. Everything else is a `component add` away,
-and nothing is downloaded until you ask for it — with one exception: the first
-command trustup passes to rustup fetches rustup itself, since it cannot pass
-anything to a tool that is not there.
+That is the whole default install. Nothing is downloaded until you ask for it,
+with one exception: the first command trustup passes to rustup fetches rustup itself.
 
 
 ## What if I miss something?
@@ -112,7 +122,7 @@ And the rest:
 ## Not done
 
 - No `update`: reinstall is `rm -rf ~/.rustup/toolchains/tinyrust && trustup install`.
-- macOS aarch64 only. Nothing pinned — `trustup` takes today's stable manifest.
+- macOS aarch64 only.
 
 
 # Development
@@ -127,13 +137,18 @@ Not needed to use tinyrust. `PLAN-rustc.md` has the derivations.
     ./build-rustc strip          # drop symbols from the compiler and tools
     ./build-rustc dist           # tarballs + manifest; refuses non-fat trees
 
+`trustup` installs from the tinyrust release by default. Point it elsewhere with
+`TRUSTUP_DIST=$PWD/dist` to use a local build, and set `TINYRUST_DIST_BASE` when
+packaging so the manifest carries the URLs the packages will actually live at —
+without it they point at the build machine.
+
 
 ## How we make Rust tiny
 
 ### rustc: −48% on the compiler
 
 We combine several optimizations:
-- limited target support: aarch64 and x86, no ZSystem or RiscV
+- limited target support: aarch64 and x86, no SystemZ, no RISC-V
 - only the essential build options
 - static linking
 - LTO fat
@@ -159,13 +174,15 @@ win (`xz` already removes most of it) but is still a significant install-size ga
 `llc` and `opt` are 118.7 MB of it and rustc never invokes them. Only `rust-objcopy`
 stays because rustc requires it for `-Cstrip`.
 
-### Reduced debuginfo
+### std: −13%, and the floor
 
-    std .rmeta    99.7 MB   89% of std, required, cannot shrink
+    std .rmeta    99.7 MB   89% of std
     std .rlib     10.1 MB
 
-`debuginfo-level-std = 0` saves 17.5 MB; the cost is line numbers for
-precompiled std frames in backtraces.
+`debuginfo-level-std = 0` saves 17.5 MB off the rlibs; the cost is line numbers
+for precompiled std frames in backtraces. The `.rmeta` is metadata every generic
+instantiation is built from — required, and the reason std cannot go much below
+110 MB.
 
 ## No binary links outside the OS
 
