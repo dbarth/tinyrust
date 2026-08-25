@@ -35,7 +35,20 @@ doctests, and its own compiler again — stage2 self-hosts to within 0.02%.
     curl -sSfL https://raw.githubusercontent.com/dbarth/tinyrust/master/install.sh | sh
     cargo new hello && cd hello && cargo run --release
 
-No prompt: there is one profile and it is the small one. The toolchain goes to
+No prompt: there is one profile and it is the small one. `rustup` is aliased to
+`trustup`, so existing habits and scripts keep working — but it does not pretend
+to be rustup:
+
+    $ rustup --version
+    trustup -- a thin rustup wrapper, installing a tinyrust toolchain
+      toolchain  rustc 1.98.0-dev at ~/.rustup/toolchains/tinyrust
+      this is not rustup. Commands it does not handle are passed through to
+      the real one, fetched on demand. For the full official toolchain:
+        trustup install --rustup
+
+Start small, switch to the full toolchain with the same tool if you ever need
+it. An existing rustup is never touched: its `rustup`, `cargo`, `rustc` and
+`rustdoc` in `~/.cargo/bin` are left alone and you use `trustup` by name. The toolchain goes to
 `~/.rustup/toolchains/tinyrust` — rustup's own layout, so the two coexist and
 `rustup default tinyrust` works if a rustup ever turns up — and the binaries are
 linked into `~/.cargo/bin`, which is added to your shell profile. `~/.cargo`
