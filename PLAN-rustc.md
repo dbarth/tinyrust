@@ -282,3 +282,75 @@ so: out of stock go cargo, rust-analyzer, the gdb/lldb wrappers, `libexec`,
 target: this build is *larger* than stock overall, and buys cross-compilation
 to x86_64 for it. Which row matters depends on whether the second std is
 wanted; both are printed so neither can be quoted alone.
+
+
+## Third pass: where the remaining mass actually is
+
+Comparison is now against the matched set — stock ships one std target, so this
+counts one:
+
+    bucket     stock          this build
+    rustc      212.7 MB       115.4 MB
+    std        128.9 MB       111.7 MB
+    tools       77.2 MB            --
+    other        0.7 MB            --
+    -------------------------------------
+    total      419.4 MB       227.2 MB
+
+    rustc + std   341.6  ->  227.2 MB    -33%
+    rustc alone   212.3  ->  115.4 MB    -46%
+
+(+114.4 MB if the x86_64 std is kept, which is a capability stock does not have.)
+
+### Stripping the compiler: 33.6 MB, no cost
+
+`librustc_driver` still carried a full symbol table. `strip -x` — local symbols
+out, exported symbols kept, so the dylib stays loadable — takes it from 149.0
+to **115.4 MB**. Verified afterwards: compiles, runs tests, cross-compiles to
+x86_64, LTO works, and user backtraces symbolicate exactly as before, because
+those resolve against the user's own binary.
+
+`rust.strip = true` is the supported knob but is **not usable here**: it applies
+`-Cstrip=symbols` to std as well, and stripping an rlib runs `rust-objcopy`,
+part of the llvm-tools component we do not ship. Stripping std would be wrong
+anyway — those archives are linked into user programs and need their symbols.
+So `build-rustc strip` does the compiler alone.
+
+### .rmeta: 99.7 MB, and immovable
+
+Nearly all of std is sidecar metadata. Three things establish that it cannot be
+touched:
+
+1. **It is required.** Moving all 26 `.rmeta` files aside and compiling gives
+   `only metadata stub found for rlib dependency std`. Bootstrap builds std
+   with `-Zno-embed-metadata`, so the rlib holds a 0.4 KB stub and the sidecar
+   holds everything. There is no duplication to reclaim.
+2. **It is mostly MIR.** `-Zmeta-stats` on a small generic crate: `mir` 55.1%,
+   `tables` 11.3%, everything else in single digits. That MIR is what makes
+   generic and `#[inline]` functions instantiable downstream. `core` is almost
+   entirely generic, so its share is higher, not lower.
+3. **It is uncompressed on purpose.** `libcore.rmeta` gzips 61.2 -> 17.5 MB and
+   zstd -3 to 15.6 MB, so ~72 MB per target is theoretically on the table. But
+   rustc mmaps metadata and decodes it lazily; the "inflate" in `locator.rs` is
+   a buffer slice, not decompression. Compressing would force a full decode on
+   every crate load. It is a deliberate speed-for-size trade, and there is no
+   flag for it.
+
+### Build-time options, surveyed
+
+Already taken: `debug = false` (17.5 MB of std rlibs), `llvm-tools = false`,
+static LLVM, two targets, no libxml2, and now the strip.
+
+Left on the table, with what each costs:
+
+    rust.lto = "fat"          single-digit MB. LLVM's half is not bitcode, so
+                              only rustc's Rust code is in scope.
+    rust.codegen-units = 1    smaller and faster code, much slower build.
+    rust.std-features         dropping panic_unwind or backtrace would shrink
+                              std meaningfully and break panics or backtraces.
+                              Not worth it for a general-purpose toolchain.
+    rust.jemalloc             already false.
+    llvm.assertions           already false.
+
+The honest summary: after the strip, rustc and std are within 4 MB of each
+other, and 89% of std is metadata nobody can remove. The cheap wins are gone.

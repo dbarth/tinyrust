@@ -6,6 +6,7 @@
 #   build-rustc fetch      clone rust at the pinned version
 #   build-rustc configure  write bootstrap.toml pointing at ./llvm
 #   build-rustc build      ./x build  (RUSTC_STAGE=2 for a self-hosted build)
+#   build-rustc strip      strip the compiler binaries (not std)
 #   build-rustc measure    compare the result against the stock toolchain
 #
 # See PLAN-rustc.md for why this should work and what it cannot fix.
@@ -153,6 +154,28 @@ cmd_build() {
   note "stage$STAGE at $SRC/build/$TRIPLE/stage$STAGE"
 }
 
+# rust.strip = true would be the supported knob, but it applies -Cstrip=symbols
+# to std as well, and stripping an rlib means running rust-objcopy -- part of
+# the llvm-tools component we deliberately do not ship. Stripping std would be
+# wrong regardless: those archives are linked into user programs and need their
+# symbols. So strip the compiler alone, which is where the 34 MB is.
+cmd_strip() {
+  local out="$SRC/build/$TRIPLE/stage$STAGE"
+  [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
+  local f before after
+  for f in "$out"/lib/librustc_driver-*.dylib "$out"/bin/rustc; do
+    [ -f "$f" ] || continue
+    before=$(stat -f%z "$f")
+    # -x removes local symbols and keeps exported ones, which is what a dylib
+    # needs to stay loadable.
+    strip -x "$f"
+    after=$(stat -f%z "$f")
+    awk -v b=$before -v a=$after -v n="$(basename "$f")" \
+      'BEGIN{printf "  %-34s %7.1f -> %7.1f MB\n", n, b/1048576, a/1048576}'
+  done
+  note "rebuild to undo"
+}
+
 cmd_measure() {
   local out="$SRC/build/$TRIPLE/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
@@ -234,6 +257,7 @@ case "${1:-}" in
   fetch)     cmd_fetch ;;
   configure) cmd_configure ;;
   build)     cmd_build ;;
+  strip)     cmd_strip ;;
   measure)   cmd_measure ;;
-  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac
