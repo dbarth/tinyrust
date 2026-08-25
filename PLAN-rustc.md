@@ -467,3 +467,64 @@ clippy and rustfmt are separate rustup components a user can add on demand, and
 neither changes what can be built. rust-analyzer is editor-only. rustdoc is
 *not* optional in practice -- `cargo test` on a library with doc examples needs
 it.
+
+
+## Build-host leaks are now checked, not remembered
+
+Three times a shipped binary picked up a library from the build machine that
+would not exist on a user's:
+
+    librustc_driver -> /opt/homebrew/opt/zstd/lib/libzstd.1.dylib
+    cargo           -> /opt/homebrew/opt/openssl@3/lib/{libssl,libcrypto}.3.dylib
+    rust-objcopy    -> /opt/homebrew/opt/zstd/lib/libzstd.1.dylib
+
+The first two were found by hand. The third was found by `build-rustc verify`
+within seconds of writing it, which is the argument for having it.
+
+`verify` walks every Mach-O in the toolchain and fails the build unless each
+dependency resolves to `/usr/lib`, `/System`, or the toolchain itself
+(`@rpath`, `@loader_path`, `@executable_path`). It runs at the end of every
+build; it is not an optional step.
+
+`bundle` is the fix for the case where static linking is not available. ./llvm
+is a set of prebuilt binaries built against Homebrew's zstd, so anything
+bootstrap copies out of it inherits that. `bundle` copies each non-system
+library into the toolchain, repoints the binary with `@loader_path/../lib`, and
+re-signs both ad-hoc -- `install_name_tool` invalidates the code signature, and
+unsigned Mach-O will not run on arm64. Same trick trustup already uses for
+libLLVM.dylib. Cost: 0.62 MB for libzstd.
+
+### rust-objcopy is not optional
+
+Tested by removing it: `cargo build --release` with `strip = true` fails with
+`error: unable to run rust-objcopy: No such file or directory`. Not a warning
+-- the build does not complete. rustc requires it for `-Cstrip` on macOS, so it
+is the one llvm-tool that has to ship.
+
+### The reqwest / gitoxide idea does not apply to this cargo
+
+Worth recording since it looks plausible. `openssl-sys` reaches cargo through
+four paths, all mandatory:
+
+    openssl-sys <- curl        <- cargo (direct)
+                <- curl-sys    <- cargo (direct)
+                <- libgit2-sys <- cargo (direct), and via git2
+                <- libssh2-sys <- libgit2-sys
+
+`curl`, `curl-sys`, `git2`, `git2-curl` and `libgit2-sys` are declared without
+`optional = true`, so no feature removes them. And the two features that look
+relevant only swap *gitoxide's* HTTP backend:
+
+    http-transport-curl    = ["gix/blocking-http-transport-curl"]
+    http-transport-reqwest = ["gix/blocking-http-transport-reqwest"]
+
+Cargo's own registry transport stays curl either way, so reqwest would remove
+one edge and add a second TLS stack -- a larger binary, not a smaller one.
+Bootstrap could not select it regardless: `build.tool.cargo.features` only
+extends the feature list (tool.rs:221) and there is no `--no-default-features`
+path for tools, so the default `http-transport-curl` would stay on and violate
+cargo's own "exactly one" rule.
+
+The leak it was aiming at is already closed by `vendored-openssl`: our cargo
+links exactly what the official one does, plus libz, with libgit2 and OpenSSL
+static inside it.

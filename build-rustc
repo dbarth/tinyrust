@@ -8,6 +8,8 @@
 #   build-rustc build      ./x build  (RUSTC_STAGE=2 for a self-hosted build)
 #   build-rustc strip      strip the compiler binaries (not std)
 #   build-rustc trim       drop the llvm-tools nothing calls
+#   build-rustc bundle     pull non-system libs into the toolchain, repoint, re-sign
+#   build-rustc verify     fail if any binary links outside /usr/lib and /System
 #   build-rustc measure    compare the result against the stock toolchain
 #
 # See PLAN-rustc.md for why this should work and what it cannot fix.
@@ -212,6 +214,10 @@ cmd_build() {
 
   say "built"
   note "stage$STAGE at $SRC/build/$TRIPLE/stage$STAGE"
+  echo
+  cmd_bundle
+  echo
+  cmd_verify
 }
 
 # rust.strip = true would be the supported knob, but it applies -Cstrip=symbols
@@ -258,6 +264,84 @@ cmd_trim() {
       'BEGIN{printf "  %-26s %7.1f -> %5.1f MB\n", t, b/1024, a/1024}'
     note "kept: ${kept:-nothing}"
   done
+}
+
+# Every shipped binary must resolve only against the OS. Anything under
+# /opt/homebrew, /usr/local or a build directory is a build-host leak: the
+# artifact works here and fails on a machine without that library. This has
+# already bitten twice -- zstd in librustc_driver, then OpenSSL in cargo -- so
+# it is checked rather than remembered.
+#
+# Allowed: /usr/lib and /System (the macOS ABI), and the @rpath/@loader_path/
+# @executable_path forms, which resolve inside the toolchain itself.
+# ./llvm's binaries were built against Homebrew's zstd, so anything bootstrap
+# copies out of them (rust-objcopy, which rustc *requires* for -Cstrip and
+# which cargo triggers via `strip` in release profiles) carries a hard
+# dependency on /opt/homebrew. Copy each such library into the toolchain and
+# repoint the binary at it with @loader_path, which is the same trick trustup
+# uses for libLLVM.dylib. install_name_tool invalidates the code signature, so
+# both files are re-signed ad-hoc -- unsigned Mach-O will not run on arm64.
+cmd_bundle() {
+  local out="$SRC/build/$TRIPLE/stage$STAGE"
+  [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
+  local f dep libdir base n=0
+
+  while IFS= read -r f; do
+    case "$(file -b "$f" 2>/dev/null)" in *Mach-O*) ;; *) continue ;; esac
+    libdir="$(dirname "$f")/../lib"
+    while IFS= read -r dep; do
+      case "$dep" in
+        /usr/lib/*|/System/*|@*|"") continue ;;
+      esac
+      [ -f "$dep" ] || { note "WARNING: $(basename "$f") wants missing $dep"; continue; }
+      mkdir -p "$libdir"
+      base="$(basename "$dep")"
+      if [ ! -f "$libdir/$base" ]; then
+        cp -L "$dep" "$libdir/$base"
+        chmod u+w "$libdir/$base"
+        install_name_tool -id "@loader_path/$base" "$libdir/$base" 2>/dev/null
+        codesign -f -s - "$libdir/$base" 2>/dev/null
+      fi
+      chmod u+w "$f"
+      install_name_tool -change "$dep" "@loader_path/../lib/$base" "$f" 2>/dev/null
+      codesign -f -s - "$f" 2>/dev/null
+      note "bundled $base for $(basename "$f")"
+      n=$((n + 1))
+    done < <(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}')
+  done < <(find "$out/bin" "$out/lib" -type f \( -perm -u+x -o -name '*.dylib' \) 2>/dev/null)
+
+  if [ "$n" -eq 0 ]; then note "nothing needed bundling"; fi
+}
+
+cmd_verify() {
+  local out="$SRC/build/$TRIPLE/stage$STAGE"
+  [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
+  local f dep bad=0 checked=0
+
+  while IFS= read -r f; do
+    # Mach-O only; rlibs are archives and are never linked as such.
+    case "$(file -b "$f" 2>/dev/null)" in
+      *Mach-O*) ;;
+      *) continue ;;
+    esac
+    checked=$((checked + 1))
+    while IFS= read -r dep; do
+      case "$dep" in
+        /usr/lib/*|/System/*|@rpath/*|@loader_path/*|@executable_path/*) ;;
+        "") ;;
+        *)
+          printf '  LEAK  %-28s -> %s\n' "$(basename "$f")" "$dep"
+          bad=$((bad + 1))
+          ;;
+      esac
+    done < <(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}')
+  done < <(find "$out/bin" "$out/lib" -type f \( -perm -u+x -o -name '*.dylib' \) 2>/dev/null)
+
+  if [ "$bad" -gt 0 ]; then
+    die "$bad build-host leak(s) across $checked binaries -- see above"
+  fi
+  say "no build-host leaks"
+  note "$checked Mach-O files, all resolving to /usr/lib, /System or the toolchain"
 }
 
 cmd_measure() {
@@ -343,6 +427,8 @@ case "${1:-}" in
   build)     cmd_build ;;
   strip)     cmd_strip ;;
   trim)      cmd_trim ;;
+  bundle)    cmd_bundle ;;
+  verify)    cmd_verify ;;
   measure)   cmd_measure ;;
-  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac
