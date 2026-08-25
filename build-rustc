@@ -286,20 +286,23 @@ cmd_trim() {
 # code path to install it: <pkg>-<version>-<triple>.tar.xz containing
 # <pkg>-<version>-<triple>/<component>/<files>, plus a channel manifest giving
 # a URL and a SHA-256 per component. Point TRUSTUP_DIST at the output directory
-# and TRUSTUP_CHANNEL at the channel name to install from it.
+# to install from it.
 cmd_dist() {
   local out="$SRC/build/$TRIPLE/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
-  local dist="$HERE/dist" chan="${TRUSTUP_CHANNEL:-local}"
+  local dist="$HERE/dist" chan=local
   rm -rf "$dist"; mkdir -p "$dist"
 
   local mf="$dist/channel-rust-$chan.toml"
   printf '# Written by build-rustc dist. Not an official rust manifest.\n' > "$mf"
+  printf 'manifest-version = "2"\n' >> "$mf"
+  # trustup prints this when installing; the official manifest carries one.
+  printf 'date = "%s"\n' "$(date -u +%Y-%m-%d)" >> "$mf"
   printf 'version = "%s"\n\n' "$VERSION" >> "$mf"
 
-  pack() { # pack <pkg> <files-relative-to-out...>
-    local pkg="$1"; shift
-    local stem="$pkg-$VERSION-$TRIPLE"
+  pack() { # pack <pkg> <triple> <files-relative-to-out...>
+    local pkg="$1" tri="$2"; shift 2
+    local stem="$pkg-$VERSION-$tri"
     local stage="$dist/.stage/$stem/$pkg"
     rm -rf "$dist/.stage"; mkdir -p "$stage"
     local f
@@ -312,13 +315,14 @@ cmd_dist() {
     rm -rf "$dist/.stage"
     local hash; hash="$(shasum -a 256 "$dist/$stem.tar.xz" | cut -d' ' -f1)"
     cat >> "$mf" <<TOML
-[pkg.$pkg.target.$TRIPLE]
+[pkg.$pkg.target.$tri]
 available = true
 xz_url = "file://$dist/$stem.tar.xz"
 xz_hash = "$hash"
 
 TOML
-    ls -l "$dist/$stem.tar.xz" | awk -v p="$pkg" '{printf "  %-10s %6.1f MB\n", p, $5/1048576}'
+    ls -l "$dist/$stem.tar.xz" | awk -v p="$pkg $tri" '{printf "  %-34s %6.1f MB
+", p, $5/1048576}'
   }
 
   say "packaging stage$STAGE"
@@ -329,21 +333,19 @@ TOML
   for d in "$out"/lib/*.dylib; do
     [ -e "$d" ] && rustc_files="$rustc_files lib/$(basename "$d")"
   done
-  pack rustc $rustc_files
-  pack cargo bin/cargo
+  pack rustc "$TRIPLE" $rustc_files
+  pack cargo "$TRIPLE" bin/cargo
+  # One rust-std per target, each keyed by its own triple. trustup installs the
+  # host's; the others are there for a later `target add` and are not fetched
+  # by default.
   local t
   for t in $TARGETS; do
-    [ -d "$out/lib/rustlib/$t/lib" ] || continue
-    if [ "$t" = "$TRIPLE" ]; then
-      pack rust-std "lib/rustlib/$t/lib"
-    else
-      note "skipping $t -- one manifest entry per triple is not modelled yet"
-    fi
+    [ -d "$out/lib/rustlib/$t/lib" ] && pack rust-std "$t" "lib/rustlib/$t/lib"
   done
 
   echo
   say "install it with"
-  note "TRUSTUP_DIST=file://$dist TRUSTUP_CHANNEL=$chan ./trustup install <dir>"
+  note "TRUSTUP_DIST=$dist ./trustup install <dir>"
 }
 
 cmd_bundle() {
