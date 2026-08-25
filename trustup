@@ -279,8 +279,11 @@ cmd_component() {
 
   local p; p="$(prefix)"
 
-  # A --rustup install has the real thing; pass straight through to it.
-  if [ -d "$ROOT/rustup" ]; then
+  # A --rustup install lets rustup own the toolchain, so components are its
+  # business. A direct install is ours even when a rustup exists alongside it --
+  # passthrough installs one on first use, and it manages a *linked* toolchain
+  # that has no components of its own.
+  if [ ! -f "$p/.trustup-components" ] && [ -d "$ROOT/rustup" ]; then
     export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
     exec "$CARGO_HOME/bin/rustup" component "$verb" "$@"
   fi
@@ -313,10 +316,33 @@ INNER
     return
   fi
 
-  say "adding to $p (from $channel)"
-  local pkg
+  # Three outcomes, never a silent mix. A component this dist provides comes
+  # from this dist. One the dist declares upstream-ok is fetched from the
+  # official channel, because it only runs rustc or carries no code at all.
+  # Anything else links librustc_driver or loads .rmeta, and the official build
+  # of it was compiled by a different rustc -- E0514, not a subtle bug.
+  local ok; ok=" $(sed -n 's/^upstream-ok = \[\(.*\)\]/\1/p' "$mf" | tr -d '",' ) "
+  local omf="" pkg
+  say "adding to $p"
   for pkg in "$@"; do
-    fetch_component "$pkg" "$triple" "$mf" "$p" "$work" no
+    if grep -q "^\[pkg\.$pkg\.target\.$triple\]" "$mf"; then
+      note "$pkg from $channel"
+      fetch_component "$pkg" "$triple" "$mf" "$p" "$work" no
+    elif [ "$DIST" != "https://static.rust-lang.org/dist" ] && \
+         case "$ok" in *" $pkg "*) true ;; *) false ;; esac; then
+      if [ -z "$omf" ]; then
+        omf="$work/official.toml"
+        curl -sSfL -o "$omf" "https://static.rust-lang.org/dist/channel-rust-stable.toml" \
+          || die "could not fetch the official manifest"
+      fi
+      note "$pkg from the official dist (compiler-independent)"
+      DIST=https://static.rust-lang.org/dist \
+        fetch_component "$pkg" "$triple" "$omf" "$p" "$work" no
+    else
+      die "$pkg is not in this dist, and is not safe to take from the official
+       one: it links librustc_driver or loads crate metadata, and the official
+       build of it was compiled by a different rustc. Build it with build-rustc."
+    fi
   done
   say "now: $(mb "$p") MB"
 }
