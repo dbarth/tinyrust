@@ -87,6 +87,8 @@ jobs:
         env:
           RUSTC_LTO: fat
           RUSTC_STAGE: "2"
+          # Without this the manifest points at this runner's disk.
+          TINYRUST_DIST_BASE: https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag || github.ref_name }}
         run: |
           ./build-rustc dist
           ls -l dist

@@ -34,11 +34,15 @@ CARGO_BIN="${TRUSTUP_CARGO_BIN:-$HOME/.cargo/bin}"
 
 # A local dist is always the "local" channel -- pointing TRUSTUP_DIST at a
 # directory is the whole switch, there is no second variable to set.
-CHANNEL="${TRUSTUP_CHANNEL:-$([ -n "${TRUSTUP_DIST:-}" ] && echo local || echo stable)}"
+CHANNEL="${TRUSTUP_CHANNEL:-tinyrust}"
 # Point TRUSTUP_DIST at a directory of tarballs written by `build-rustc dist`
 # (a file:// URL works -- curl handles it) to install a locally built toolchain
 # instead of the official one. Same manifest format, same fetch path.
-DIST="${TRUSTUP_DIST:-https://static.rust-lang.org/dist}"
+# The tiny packages, unless told otherwise. Falls back to the official dist if
+# no release is reachable -- see resolve_dist.
+TINYRUST_RELEASE="${TINYRUST_RELEASE:-latest}"
+OFFICIAL="https://static.rust-lang.org/dist"
+DIST="${TRUSTUP_DIST:-https://github.com/dbarth/tinyrust/releases/download/$TINYRUST_RELEASE}"
 case "$DIST" in */|*://*) ;; *) DIST="file://$DIST" ;; esac
 
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }

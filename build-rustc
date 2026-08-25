@@ -411,7 +411,11 @@ cmd_dist() {
   RUSTC_LTO=fat RUSTC_STAGE=$STAGE $0 build
   $0 trim && $0 strip && RUSTC_LTO=fat $0 dist"
 
-  local dist="$HERE/dist" chan=local
+  local dist="$HERE/dist" chan="${TINYRUST_CHANNEL:-tinyrust}"
+  # Where the packages will be served from. Left as file:// the manifest only
+  # works on this machine, which is fine for testing and wrong for a release --
+  # CI sets this to the release download URL.
+  local base="${TINYRUST_DIST_BASE:-file://$dist}"
   rm -rf "$dist"; mkdir -p "$dist"
 
   local mf="$dist/channel-rust-$chan.toml"
@@ -459,7 +463,7 @@ cmd_dist() {
     cat >> "$mf" <<TOML
 [pkg.$pkg.target.$tri]
 available = true
-xz_url = "file://$dist/$stem.tar.xz"
+xz_url = "$base/$stem.tar.xz"
 xz_hash = "$hash"
 
 TOML
@@ -520,6 +524,7 @@ TOML
   echo
   say "install it with"
   note "TRUSTUP_DIST=$dist ./trustup install <dir>"
+  note "base $base"
 }
 
 cmd_bundle() {
