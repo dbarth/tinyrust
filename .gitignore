@@ -3,3 +3,4 @@ llvm/
 rust/
 build.log
 dist/
+dist-llvm/

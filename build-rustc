@@ -3,6 +3,8 @@
 # build-rustc -- build rustc against the lean LLVM in ./llvm, so the linker
 # keeps only what the compiler actually calls.
 #
+#   build-rustc llvm       fetch and prune wasmer's LLVM into ./llvm
+#   build-rustc llvm-pack  tar the pruned ./llvm for publishing
 #   build-rustc fetch      clone rust at the pinned version
 #   build-rustc configure  write bootstrap.toml pointing at ./llvm
 #   build-rustc build      ./x build  (RUSTC_STAGE=2 for a self-hosted build)
@@ -17,7 +19,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LLVM="$HERE/llvm"
+LLVM="${TINYRUST_LLVM:-$HERE/llvm}"
 SRC="$HERE/rust"
 
 # The version the measurements in PLAN-rustc.md were taken against, so the
@@ -97,6 +99,93 @@ check_llvm() {
     n=$((n+1))
   done
   if [ "$n" -gt 0 ]; then note "         linked $n new binaries into it"; fi
+}
+
+# ./llvm is wasmer's prebuilt LLVM, pruned. Set up by hand until now, which
+# meant CI could not reproduce it. The tarball is 457 MB and unpacks to 2.7 GB;
+# we keep about 770 MB of it.
+LLVM_RELEASE="${LLVM_RELEASE:-22.x}"
+LLVM_TARBALL="${LLVM_TARBALL:-llvm-darwin-aarch64.tar.xz}"
+LLVM_TRIPLE="${LLVM_TRIPLE:-darwin-aarch64}"
+LLVM_URL="${LLVM_URL:-https://github.com/wasmerio/llvm-custom-builds/releases/download/$LLVM_RELEASE/$LLVM_TARBALL}"
+
+# The pruned result, published so a toolchain build does not repeat the 2.7 GB
+# unpack. Set TINYRUST_LLVM_URL to one of these and cmd_llvm takes the fast
+# path: one download, no pruning.
+cmd_llvm_pack() {
+  [ -x "$LLVM/bin/llvm-config" ] || die "nothing to pack -- run '$0 llvm'"
+  local v; v="$("$LLVM/bin/llvm-config" --version)"
+  # Not dist/: `dist` wipes that directory, and this artifact is published on
+  # its own schedule -- it changes only when LLVM does.
+  local out="$HERE/dist-llvm/tinyrust-llvm-$v-$LLVM_TRIPLE.tar.xz"
+  mkdir -p "$HERE/dist-llvm"
+  say "packing $LLVM"
+  ( cd "$(dirname "$LLVM")" && tar cf - "$(basename "$LLVM")" ) | xz -9 -T0 > "$out"
+  ls -l "$out" | awk '{printf "  %.0f MB  %s\n", $5/1048576, $NF}'
+  shasum -a 256 "$out" | awk '{print "  sha256 "$1}'
+}
+
+cmd_llvm() {
+  if [ -x "$LLVM/bin/llvm-config" ] && [ "${1:-}" != "--force" ]; then
+    note "$LLVM already set up ($("$LLVM/bin/llvm-config" --version)) -- --force to redo"
+    return
+  fi
+  local work; work="$(mktemp -d)"
+  trap 'rm -rf "$work"' RETURN
+
+  # Fast path: an already-pruned tree, 770 MB unpacked instead of 2.7 GB.
+  if [ -n "${TINYRUST_LLVM_URL:-}" ]; then
+    say "fetching pruned llvm"
+    curl -sSfL --retry 3 -o "$work/llvm.tar.xz" "$TINYRUST_LLVM_URL" \
+      || die "could not download $TINYRUST_LLVM_URL"
+    # The tarball's top-level directory is whatever the packing tree was
+    # called, which need not match this one. Unpack aside and move it in.
+    mkdir -p "$work/x" && tar -xJf "$work/llvm.tar.xz" -C "$work/x"
+    local top; top="$(find "$work/x" -maxdepth 1 -mindepth 1 -type d | head -1)"
+    [ -n "$top" ] || die "empty archive at $TINYRUST_LLVM_URL"
+    rm -rf "$LLVM"; mkdir -p "$(dirname "$LLVM")"
+    mv "$top" "$LLVM"
+    # llvm-config-lean is versioned in this repo, so refresh it rather than
+    # trusting whatever the artifact was packed with.
+    install -m 755 "$HERE/llvm-config-lean" "$LLVM/bin/llvm-config"
+    check_llvm
+    return
+  fi
+
+  say "fetching $LLVM_TARBALL"
+  curl -sSfL --retry 3 -o "$work/llvm.tar.xz" "$LLVM_URL" \
+    || die "could not download $LLVM_URL"
+  note "$(ls -l "$work/llvm.tar.xz" | awk '{printf "%.0f MB", $5/1048576}')"
+
+  say "unpacking (2.7 GB, most of which is thrown away)"
+  mkdir -p "$work/x" && tar -xJf "$work/llvm.tar.xz" -C "$work/x"
+  rm -f "$work/llvm.tar.xz"
+  # The tarball may or may not have a single top-level directory.
+  local root="$work/x"
+  [ -d "$root/lib" ] || root="$(find "$work/x" -maxdepth 2 -type d -name lib | head -1 | xargs dirname)"
+  [ -d "$root/lib" ] || die "unexpected tarball layout under $work/x"
+
+  say "keeping the archives, the headers and 16 binaries"
+  rm -rf "$LLVM"; mkdir -p "$LLVM/bin" "$LLVM/usr"
+  cp -R "$root/lib" "$LLVM/lib"
+  mkdir -p "$LLVM/usr/include" && cp -R "$root"/usr/include/. "$LLVM/usr/include/" 2>/dev/null \
+    || cp -R "$root"/include/. "$LLVM/usr/include/"
+
+  # llvm-config drives the build; the 14 LLVM_TOOLS have to exist in --bindir
+  # for bootstrap's llvm-tools step; llvm-ranlib pairs with llvm-ar.
+  local b
+  for b in llvm-config llvm-ranlib \
+           llvm-cov llvm-nm llvm-objcopy llvm-objdump llvm-profdata llvm-readobj \
+           llvm-size llvm-strip llvm-ar llvm-as llvm-dis llvm-link llc opt; do
+    if [ -f "$root/bin/$b" ]; then cp -L "$root/bin/$b" "$LLVM/bin/$b"
+    else note "WARNING: $b missing from the tarball"; fi
+  done
+  mv "$LLVM/bin/llvm-config" "$LLVM/bin/llvm-config.real"
+  install -m 755 "$HERE/llvm-config-lean" "$LLVM/bin/llvm-config"
+
+  say "done"
+  check_llvm
+  note "kept $(du -sh "$LLVM" | cut -f1)"
 }
 
 cmd_fetch() {
@@ -579,6 +668,8 @@ cmd_measure() {
 }
 
 case "${1:-}" in
+  llvm)      shift; cmd_llvm "$@" ;;
+  llvm-pack) cmd_llvm_pack ;;
   fetch)     cmd_fetch ;;
   configure) cmd_configure ;;
   build)     cmd_build ;;
@@ -588,5 +679,5 @@ case "${1:-}" in
   dist)      cmd_dist ;;
   verify)    cmd_verify ;;
   measure)   cmd_measure ;;
-  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac
