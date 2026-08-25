@@ -1,0 +1,36 @@
+# Prune wasmer's LLVM once and publish the result, so toolchain builds do not
+# repeat a 457 MB download and a 2.7 GB unpack every time. Re-run only when
+# LLVM_RELEASE changes.
+#
+#   wasmer tarball   457 MB  ->  2.7 GB unpacked
+#   what we keep     768 MB  ->  115 MB packed
+name: llvm
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "wasmer llvm-custom-builds release (e.g. 22.x)"
+        default: "22.x"
+
+jobs:
+  prune:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: make room
+        run: |
+          sudo rm -rf /Applications/Xcode*.app
+          df -h / | tail -1
+      - run: brew install zstd
+      - name: fetch and prune
+        env:
+          LLVM_RELEASE: ${{ inputs.release }}
+        run: ./build-rustc llvm
+      - run: ./build-rustc llvm-pack
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: llvm-${{ inputs.release }}
+          files: dist-llvm/*
+          fail_on_unmatched_files: true

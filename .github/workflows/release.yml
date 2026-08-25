@@ -1,0 +1,102 @@
+# Build a tinyrust toolchain on macOS and attach it to a release.
+#
+# The awkward parts, all of them macOS-specific:
+#
+#   disk    the build leaves ~15 GB of intermediates for 233 MB of output, and
+#           a GitHub macOS runner has roughly 14 GB free. Xcode is deleted
+#           first, which buys back more than the build needs. The LLVM comes
+#           in pre-pruned from the llvm workflow, so this runner never sees
+#           the 2.7 GB unpack.
+#   arch    macos-14/15 runners are arm64; an x86_64 *host* toolchain needs
+#           macos-13. std for both targets is cross-built from either.
+#   cost    macOS minutes bill at 10x on private repos. A run is ~35 minutes,
+#           so ~350 billable minutes. Public repos are free.
+#   zstd    wasmer's LLVM binaries link Homebrew's libzstd, and macOS ships
+#           none, so the runner needs it before anything links.
+#   signing binaries are ad-hoc signed by `build-rustc bundle`. That is enough
+#           to run, but not notarized: a user who downloads the tarball in a
+#           browser gets a Gatekeeper prompt. curl does not set the quarantine
+#           bit, which is why the installer uses it.
+name: release
+
+env:
+  LLVM_VERSION: "22.1.8"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "release tag to publish to"
+        required: true
+  push:
+    tags: ["v*"]
+
+jobs:
+  macos:
+    runs-on: macos-14          # arm64. macos-13 for an x86_64 host build.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # ~15 GB of intermediates against ~14 GB free. Xcode is the only thing
+      # big enough to matter, and the build needs only the command line tools.
+      - name: make room
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /Applications/Xcode*.app
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches
+          df -h / | tail -1
+
+      - name: zstd
+        run: brew install zstd
+
+      # The pruned artifact from the llvm workflow: 115 MB, unpacking to 768 MB.
+      # Without it this step is a 457 MB download and a 2.7 GB unpack.
+      - name: cache llvm
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: llvm
+          key: llvm-${{ env.LLVM_VERSION }}-darwin-aarch64-v1
+
+      - name: fetch llvm
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        env:
+          TINYRUST_LLVM_URL: https://github.com/${{ github.repository }}/releases/download/llvm-22.x/tinyrust-llvm-${{ env.LLVM_VERSION }}-darwin-aarch64.tar.xz
+        run: ./build-rustc llvm
+
+      - name: fetch rust
+        run: ./build-rustc fetch
+
+      - name: build
+        env:
+          RUSTC_LTO: fat       # dist refuses anything else
+          RUSTC_STAGE: "2"
+        run: |
+          ./build-rustc configure
+          ./build-rustc build
+
+      - name: trim, strip, verify
+        env: { RUSTC_STAGE: "2" }
+        run: |
+          ./build-rustc trim
+          ./build-rustc strip
+          ./build-rustc verify
+
+      - name: package
+        env:
+          RUSTC_LTO: fat
+          RUSTC_STAGE: "2"
+        run: |
+          ./build-rustc dist
+          ls -l dist
+
+      - name: measure
+        env: { RUSTC_STAGE: "2" }
+        run: ./build-rustc measure || true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
