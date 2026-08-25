@@ -203,19 +203,22 @@ cmd_install_direct() {
 # ---- rustup: the old way, kept for comparison ------------------------------
 
 cmd_install_rustup() {
-  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
+  # The real thing in its real places. $CHANNEL is a tinyrust channel name and
+  # means nothing to rustup, so the toolchain is named separately.
+  export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+  local toolchain="${RUSTUP_TOOLCHAIN:-stable}"
   local triple; triple="$(host_triple)"
-  say "installing via rustup for $triple into $ROOT"
-  mkdir -p "$ROOT"
-  local init="$ROOT/rustup-init.sh"
+  say "installing $toolchain via rustup for $triple"
+  mkdir -p "$RUSTUP_HOME"
+  local init="$RUSTUP_HOME/rustup-init.sh"
   [ -f "$init" ] || curl -sSfL "https://sh.rustup.rs" -o "$init"
 
   # --profile minimal is the only knob that matters here: rustc + cargo +
   # rust-std and nothing else. The default profile adds rust-docs.
   sh "$init" -y --no-modify-path --profile minimal \
-     --default-toolchain "$CHANNEL" --default-host "$triple" >/dev/null
+     --default-toolchain "$toolchain" --default-host "$triple" >/dev/null
 
-  note "installed: $(mb "$ROOT") MB"
+  note "installed: $(mb "$RUSTUP_HOME") MB"
   say "now run: $0 trim"
 }
 
