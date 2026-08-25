@@ -7,6 +7,7 @@
 #   build-rustc configure  write bootstrap.toml pointing at ./llvm
 #   build-rustc build      ./x build  (RUSTC_STAGE=2 for a self-hosted build)
 #   build-rustc strip      strip the compiler binaries (not std)
+#   build-rustc trim       drop the llvm-tools nothing calls
 #   build-rustc measure    compare the result against the stock toolchain
 #
 # See PLAN-rustc.md for why this should work and what it cannot fix.
@@ -37,6 +38,26 @@ STAGE="${RUSTC_STAGE:-1}"
 # but at 2.75x the build time (4:08 -> 11:23), so the default is left alone for
 # iteration. Set RUSTC_LTO=fat for a release build.
 LTO="${RUSTC_LTO:-}"
+# Whether to install the llvm-tools component into the sysroot.
+LLVM_TOOLS="${RUSTC_LLVM_TOOLS:-true}"
+# Tools to build alongside the compiler. cargo is the only one that changes
+# what the toolchain can do -- without it there is no dependency resolution
+# and no build graph, only hand-compiled single files.
+# rustdoc is not optional in practice: it renders /// docs and, more
+# importantly, runs doctests, so `cargo test` on a library with doc examples
+# needs it. clippy and rustfmt are deliberately absent -- they are separate
+# rustup components a user can add, and neither affects what can be built.
+TOOLS="${RUSTC_TOOLS:-cargo rustdoc}"
+# Of the 14 binaries in the llvm-tools component (205 MB), these are kept.
+# cargo shells out to rust-objcopy to honour `strip` in release profiles.
+# Add llvm-profdata and llvm-cov if you want -C instrument-coverage to be
+# usable. llc and opt are 118.7 MB of standalone LLVM developer tools that
+# rustc never invokes.
+LLVM_TOOLS_KEEP="${RUSTC_LLVM_TOOLS_KEEP:-rust-objcopy}"
+# Codegen units for the compiler. Rust's non-incremental default is 16. Fewer
+# means better optimisation and slower builds; with fat LTO the units are
+# merged anyway, so this mostly affects the pre-LTO stage.
+CGU="${RUSTC_CGU:-}"
 
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -61,14 +82,15 @@ check_llvm() {
   # bin/ while --bindir says usr/bin, so bridge the two.
   local bindir; bindir="$("$LLVM/bin/llvm-config" --bindir)"
   note "bindir   $bindir"
-  if [ ! -e "$bindir/llvm-ar" ]; then
-    mkdir -p "$bindir"
-    for f in "$LLVM"/bin/*; do
-      ln -sf "$(python3 -c 'import os,sys;print(os.path.relpath(*sys.argv[1:3]))' "$f" "$bindir")" \
-        "$bindir/$(basename "$f")"
-    done
-    note "         linked $(ls "$LLVM/bin" | wc -l | tr -d ' ') binaries into it"
-  fi
+  mkdir -p "$bindir"
+  local n=0 f
+  for f in "$LLVM"/bin/*; do
+    [ -e "$bindir/$(basename "$f")" ] && continue
+    ln -sf "$(python3 -c 'import os,sys;print(os.path.relpath(*sys.argv[1:3]))' "$f" "$bindir")" \
+      "$bindir/$(basename "$f")"
+    n=$((n+1))
+  done
+  if [ "$n" -gt 0 ]; then note "         linked $n new binaries into it"; fi
 }
 
 cmd_fetch() {
@@ -82,8 +104,10 @@ cmd_fetch() {
   fi
   # Bootstrap needs the vendored submodules; LLVM's is the big one and we are
   # supplying our own, so it stays unfetched.
+  # library/* are needed to build std at all; src/tools/cargo only for cargo.
+  # src/llvm-project stays unfetched -- we supply our own LLVM.
   git -C "$SRC" submodule update --init --depth 1 \
-    library/backtrace library/stdarch 2>/dev/null || true
+    library/backtrace library/stdarch src/tools/cargo 2>/dev/null || true
   note "at $(git -C "$SRC" describe --tags 2>/dev/null || echo "$VERSION")"
 }
 
@@ -113,6 +137,14 @@ host = ["$TRIPLE"]
 docs = false
 extended = false
 
+# cargo pulls OpenSSL in transitively through git2's https feature. Left alone
+# it links Homebrew's libssl/libcrypto and the binary will not run on a machine
+# without Homebrew -- the same trap as zstd in librustc_driver. The official
+# macOS cargo vendors OpenSSL statically (27 symbols, no dylib in otool -L), so
+# match it.
+[build.tool.cargo]
+features = ["vendored-openssl"]
+
 $(for t in $TARGETS; do
 cat <<TGT
 [target.$t]
@@ -126,16 +158,15 @@ done)
 codegen-backends = ["llvm"]
 # Debug info in the compiler itself is worth tens of MB and nothing here reads
 # a rustc backtrace.
-debug = false${LTO:+$(printf '\nlto = "%s"' "$LTO")}
+debug = false${LTO:+$(printf '\nlto = "%s"' "$LTO")}${CGU:+$(printf '\ncodegen-units = %s' "$CGU")}
 # These need LLVM's FileCheck, a test-only binary the pruned ./llvm does not
 # have. Nothing else in the build wants it.
 codegen-tests = false
-# Bootstrap would copy 14 LLVM binaries (llvm-cov, llvm-objdump, opt, llc, ...)
-# into the sysroot as the llvm-tools component. Each statically links LLVM --
-# they are the 1.7 GB of duplication the pruned ./llvm deleted, and rustc does
-# not call them. The 390 MB baseline does not include llvm-tools either, so
-# leaving them out keeps the comparison like for like.
-llvm-tools = false
+# The llvm-tools component: 14 binaries bootstrap copies into the sysroot from
+# llvm-config --bindir. Each statically links LLVM, so they are large. cargo
+# needs exactly one of them (rust-objcopy, to strip release binaries), which is
+# why this is now on -- see PLAN-rustc.md for which ones earn their place.
+llvm-tools = ${LLVM_TOOLS:-true}
 EOF
   say "wrote $cfg"
   sed 's/^/  /' "$cfg"
@@ -157,7 +188,28 @@ cmd_build() {
   # also builds rustdoc, and `tools = []` does not suppress it. The toolchain
   # we measure against is rustc + rust-std + cargo with no rustdoc, so leaving
   # it unbuilt is what makes the comparison like for like.
-  ( cd "$SRC" && ./x build --stage "$STAGE" compiler library )
+  ( cd "$SRC" && ./x build --stage "$STAGE" compiler library $TOOLS )
+  # Bootstrap leaves tools in stage<N>-tools-bin; only `./x install` moves them
+  # into the sysroot. Place them so the tree is a usable toolchain as built.
+  local tb="$SRC/build/$TRIPLE/stage$STAGE-tools-bin" t src
+  for t in $TOOLS; do
+    # bootstrap calls rustdoc's binary rustdoc_tool_binary in the tools dir.
+    case "$t" in rustdoc) src="$tb/rustdoc_tool_binary" ;; *) src="$tb/$t" ;; esac
+    local dst="$SRC/build/$TRIPLE/stage$STAGE/bin/$t"
+    if [ -f "$src" ]; then
+      # bootstrap already hardlinks some tools into the sysroot; installing
+      # over itself is an error, so only copy when they really differ.
+      if [ "$src" -ef "$dst" ]; then
+        note "$t already in the sysroot"
+      else
+        install -m 755 "$src" "$dst"
+        note "installed $t into the sysroot"
+      fi
+    else
+      note "WARNING: $t not found at $src"
+    fi
+  done
+
   say "built"
   note "stage$STAGE at $SRC/build/$TRIPLE/stage$STAGE"
 }
@@ -171,7 +223,8 @@ cmd_strip() {
   local out="$SRC/build/$TRIPLE/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
   local f before after
-  for f in "$out"/lib/librustc_driver-*.dylib "$out"/bin/rustc; do
+  # rust-objcopy comes from ./llvm already stripped, so it is not listed.
+  for f in "$out"/lib/librustc_driver-*.dylib "$out"/bin/*; do
     [ -f "$f" ] || continue
     before=$(stat -f%z "$f")
     # -x removes local symbols and keeps exported ones, which is what a dylib
@@ -182,6 +235,29 @@ cmd_strip() {
       'BEGIN{printf "  %-34s %7.1f -> %7.1f MB\n", n, b/1048576, a/1048576}'
   done
   note "rebuild to undo"
+}
+
+# The llvm-tools component installs 14 binaries, each statically linking LLVM,
+# for 205 MB. Keep only the ones something actually calls.
+cmd_trim() {
+  local out="$SRC/build/$TRIPLE/stage$STAGE"
+  [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
+  local d f before after kept
+  for d in "$out"/lib/rustlib/*/bin; do
+    [ -d "$d" ] || continue
+    before=$(du -sk "$d" | awk '{print $1}')
+    for f in "$d"/*; do
+      case " $LLVM_TOOLS_KEEP " in
+        *" $(basename "$f") "*) ;;
+        *) rm -f "$f" ;;
+      esac
+    done
+    after=$(du -sk "$d" | awk '{print $1}')
+    kept=$(ls "$d" 2>/dev/null | tr '\n' ' ')
+    awk -v b=$before -v a=$after -v t="$(basename "$(dirname "$d")")" \
+      'BEGIN{printf "  %-26s %7.1f -> %5.1f MB\n", t, b/1024, a/1024}'
+    note "kept: ${kept:-nothing}"
+  done
 }
 
 cmd_measure() {
@@ -266,6 +342,7 @@ case "${1:-}" in
   configure) cmd_configure ;;
   build)     cmd_build ;;
   strip)     cmd_strip ;;
+  trim)      cmd_trim ;;
   measure)   cmd_measure ;;
-  *) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

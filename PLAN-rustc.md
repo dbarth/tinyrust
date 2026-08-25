@@ -411,3 +411,59 @@ developed against, and dropping to 21 takes the fallback side of 13
 `LLVM_VERSION_GE(22, 0)` branches. The one case that would justify it is
 `-C linker-plugin-lto`, which hands bitcode to the *system* linker and would hit
 the same parse error.
+
+
+## Fourth pass: a toolchain you can actually use
+
+`rustc` + `std` alone cannot resolve a dependency or run a doctest. Adding the
+two tools that change what the toolchain can *do*:
+
+    bucket     stock          this build
+    rustc      212.7 MB       115.4 MB
+    std        128.9 MB       111.7 MB
+    tools       77.2 MB        43.1 MB
+    -------------------------------------
+    total      419.4 MB       270.2 MB    -36%
+
+`tools` here is cargo 28.6 + rustdoc 10.3 + rust-objcopy 4.1. Stock's 77.2 is
+cargo 30.5 + rust-analyzer 38.1 + rustlib/bin 5.6 + libexec 1.4.
+
+Verified end to end: a cargo project with a crates.io dependency
+(`serde_json`) builds, runs, `strip = true` in the release profile actually
+invokes rust-objcopy, and `cargo test --doc` runs a doctest through rustdoc.
+
+### llvm-tools: 205.3 MB in, 4.1 MB kept
+
+Bootstrap installs 14 binaries from `llvm-config --bindir`, each statically
+linking LLVM. `llc` and `opt` alone are 118.7 MB -- 58% of the component -- and
+are standalone LLVM developer tools that rustc never invokes; it drives LLVM
+in-process through its own C++ shim. Only `rust-objcopy` is called by anything
+in normal use (cargo, for `strip` in release profiles). `llvm-profdata` and
+`llvm-cov` would be needed for `-C instrument-coverage`; add them to
+`RUSTC_LLVM_TOOLS_KEEP` if wanted.
+
+### cargo had the same Homebrew trap as zstd
+
+Left alone, cargo picks up OpenSSL transitively through `git2`'s `https`
+feature and links Homebrew's copy:
+
+    /opt/homebrew/opt/openssl@3/lib/libssl.3.dylib
+    /opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib
+
+which makes the binary unrunnable without Homebrew. The official macOS cargo
+vendors OpenSSL statically -- 27 openssl symbols, no dylib in `otool -L` -- so
+`build.tool.cargo.features = ["vendored-openssl"]` matches it. Cost 3.5 MB, and
+the result has no non-system dependencies at all.
+
+### Stripping the tools
+
+    cargo          36.6 -> 28.6 MB   -22%
+    rustdoc        12.8 -> 10.3 MB   -19%
+    rust-objcopy    4.1 ->  4.1 MB     0%   (wasmer ships it stripped)
+
+### Deliberately absent
+
+clippy and rustfmt are separate rustup components a user can add on demand, and
+neither changes what can be built. rust-analyzer is editor-only. rustdoc is
+*not* optional in practice -- `cargo test` on a library with doc examples needs
+it.
