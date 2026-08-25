@@ -1,1 +1,3 @@
 toolchain/
+llvm/
+rust/

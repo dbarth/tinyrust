@@ -6,6 +6,8 @@
 #   trustup install [DIR]     fetch the three components directly (default)
 #   trustup install --rustup  drive rustup, then delete what it over-installed
 #   trustup trim              remove what a build never reads (--rustup only)
+#   trustup component list    what is installed, and what else is on offer
+#   trustup component add N   add one
 #   trustup size              where the bytes are
 #   trustup env               shell lines to use it
 #
@@ -66,9 +68,9 @@ SKIP=(
 # would be ceremony.
 manifest_field() {
   local pkg="$1" triple="$2" field="$3" mf="$4"
-  python3 - "$pkg" "$triple" "$field" "$mf" <<'PY'
+  python3 - "$pkg" "$triple" "$field" "$mf" "$0" <<'PY'
 import re, sys
-pkg, triple, field, mf = sys.argv[1:5]
+pkg, triple, field, mf, me = sys.argv[1:6]
 s = open(mf, encoding="utf-8").read()
 head = f"[pkg.{pkg}.target.{triple}]"
 i = s.find(head)
@@ -78,13 +80,19 @@ body = s[i + len(head):]
 body = body[:body.find("\n[")]
 m = re.search(rf'{field} = "([^"]+)"', body)
 if not m:
+    # The entry exists but carries no artefact: the component is real, just not
+    # built for this target on this channel. cranelift, for one, is nightly.
+    if "available = false" in body:
+        sys.exit(f"trustup: {pkg} is not available for {triple} on this channel\n"
+                 f"  some components are nightly-only -- try:\n"
+                 f"  TRUSTUP_CHANNEL=nightly {me} install && {me} component add {pkg}")
     sys.exit(f"trustup: no {field} for {pkg}/{triple}")
 print(m.group(1))
 PY
 }
 
 fetch_component() {
-  local pkg="$1" triple="$2" mf="$3" dest="$4" work="$5"
+  local pkg="$1" triple="$2" mf="$3" dest="$4" work="$5" prune="${6:-yes}"
   local url hash tarball got
 
   url="$(manifest_field "$pkg" "$triple" xz_url "$mf")"
@@ -103,8 +111,20 @@ fetch_component() {
 
   # strip 2: the archive is <pkg>-<version>-<triple>/<component>/<files>, and
   # only <files> belongs under the prefix.
-  tar -xJf "$tarball" -C "$dest" --strip-components=2 "${SKIP[@]}"
+  # Pruned only for the three that come by default. A component somebody asked
+  # for by name is extracted whole -- asking for rust-docs and getting nothing
+  # because share/doc is on the skip list would be a poor joke.
+  if [ "$prune" = yes ]; then
+    tar -xJf "$tarball" -C "$dest" --strip-components=2 "${SKIP[@]}"
+  else
+    tar -xJf "$tarball" -C "$dest" --strip-components=2
+  fi
   rm -f "$tarball"
+
+  # There is no package database here, so keep the one fact that cannot be
+  # recovered from the files afterwards: which components were asked for.
+  grep -qxF "$pkg" "$dest/.trustup-components" 2>/dev/null \
+    || printf '%s\n' "$pkg" >> "$dest/.trustup-components"
 }
 
 cmd_install_direct() {
@@ -144,6 +164,7 @@ cmd_install_direct() {
     ln -sf ../../../libLLVM.dylib "$tb/../lib/libLLVM.dylib"
   done
 
+  printf '%s\n' "$CHANNEL" > "$dest/.trustup-channel"
   say "installed: $(mb "$dest") MB"
   note "use it with: eval \"\$($0 env)\""
 }
@@ -182,6 +203,69 @@ cmd_trim() {
     rm -rf "$path"
   done
   say "$before MB -> $(mb "$ROOT") MB"
+}
+
+# ---- adding a component ----------------------------------------------------
+
+# `rustup component add` and `component list`, for an install that has no
+# rustup -- and a straight pass-through to the real one when there is.
+#
+# A component must match the toolchain it joins -- the manifest publishes one
+# version per channel per day -- so this reads the channel recorded at install
+# time rather than whatever TRUSTUP_CHANNEL happens to say now.
+#
+# `list` reads what the manifest offers for this target, which is what
+# `rustup component list` reports from the same data.
+cmd_component() {
+  local verb="${1:-list}"; shift || true
+  case "$verb" in
+    add|list) ;;
+    *) die "component takes 'add' or 'list', not '$verb'" ;;
+  esac
+  [ "$verb" = add ] && [ $# -eq 0 ] && die "component add needs a name -- '$0 component list' shows them"
+
+  local p; p="$(prefix)"
+
+  # A --rustup install has the real thing; pass straight through to it.
+  if [ -d "$ROOT/rustup" ]; then
+    export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
+    exec "$CARGO_HOME/bin/rustup" component "$verb" "$@"
+  fi
+
+  local triple; triple="$(host_triple)"
+  local channel; channel="$(cat "$p/.trustup-channel" 2>/dev/null || echo "$CHANNEL")"
+
+  local work; work="$(mktemp -d)"
+  trap 'rm -rf "$work"' RETURN
+  local mf="$work/channel.toml"
+  curl -sSfL -o "$mf" "$DIST/channel-rust-$channel.toml" \
+    || die "could not fetch the $channel manifest"
+
+  if [ "$verb" = list ]; then
+    say "components for $triple on $channel"
+    python3 - "$triple" "$mf" "$p/.trustup-components" <<'INNER'
+import os, re, sys
+triple, mf, have_file = sys.argv[1:4]
+have = set()
+if os.path.exists(have_file):
+    have = {l.strip() for l in open(have_file) if l.strip()}
+s = open(mf, encoding="utf-8").read()
+pat = r'\[pkg\.([^.\]]+)\.target\.' + re.escape(triple) + r'\](.*?)(?=\n\[)'
+for pkg, body in re.findall(pat, s, re.S):
+    if pkg in have:   note = "  (installed)"
+    elif "available = true" in body: note = ""
+    else: note = "  (not on this channel)"
+    print(f"  {pkg}{note}")
+INNER
+    return
+  fi
+
+  say "adding to $p (from $channel)"
+  local pkg
+  for pkg in "$@"; do
+    fetch_component "$pkg" "$triple" "$mf" "$p" "$work" no
+  done
+  say "now: $(mb "$p") MB"
 }
 
 # ---- looking at it ---------------------------------------------------------
@@ -230,8 +314,9 @@ case "${1:-}" in
     shift
     if [ "${1:-}" = "--rustup" ]; then shift; [ $# -eq 0 ] || ROOT="$1"; cmd_install_rustup
     else [ $# -eq 0 ] || ROOT="$1"; cmd_install_direct; fi ;;
+  component) shift; cmd_component "$@" ;;
   trim) cmd_trim ;;
   size) cmd_size ;;
   env)  cmd_env ;;
-  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+#
+# build-rustc -- build rustc against the lean LLVM in ./llvm, so the linker
+# keeps only what the compiler actually calls.
+#
+#   build-rustc fetch      clone rust at the pinned version
+#   build-rustc configure  write bootstrap.toml pointing at ./llvm
+#   build-rustc build      ./x build  (hours)
+#   build-rustc measure    compare the result against the stock toolchain
+#
+# See PLAN-rustc.md for why this should work and what it cannot fix.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LLVM="$HERE/llvm"
+SRC="$HERE/rust"
+
+# The version the measurements in PLAN-rustc.md were taken against, so the
+# comparison is like for like. Its LLVM is 22.1.8, which is what ./llvm is.
+VERSION="${RUSTC_VERSION:-1.98.0}"
+TRIPLE="aarch64-apple-darwin"
+
+say()  { printf '\033[1m%s\033[0m\n' "$*"; }
+note() { printf '  %s\n' "$*"; }
+die()  { printf 'build-rustc: %s\n' "$*" >&2; exit 1; }
+
+check_llvm() {
+  [ -x "$LLVM/bin/llvm-config" ] || die "no llvm-config in $LLVM -- see PLAN-rustc.md"
+  note "llvm     $("$LLVM/bin/llvm-config" --version)"
+  note "targets  $("$LLVM/bin/llvm-config" --targets-built)"
+  note "static   $([ -z "$(find "$LLVM/lib" -name 'libLLVM*.dylib' 2>/dev/null)" ] && echo yes || echo 'no -- expected archives')"
+}
+
+cmd_fetch() {
+  say "rust $VERSION"
+  if [ -d "$SRC/.git" ]; then
+    note "already at $SRC"
+  else
+    # Shallow, single tag: the full history is ~1 GB and nothing here reads it.
+    git clone --depth 1 --branch "$VERSION" \
+      https://github.com/rust-lang/rust.git "$SRC"
+  fi
+  # Bootstrap needs the vendored submodules; LLVM's is the big one and we are
+  # supplying our own, so it stays unfetched.
+  git -C "$SRC" submodule update --init --depth 1 \
+    library/backtrace library/stdarch 2>/dev/null || true
+  note "at $(git -C "$SRC" describe --tags 2>/dev/null || echo "$VERSION")"
+}
+
+cmd_configure() {
+  [ -d "$SRC" ] || die "no source -- run '$0 fetch'"
+  check_llvm
+  local cfg="$SRC/bootstrap.toml"
+
+  cat > "$cfg" <<EOF
+# Written by build-rustc. See ../PLAN-rustc.md.
+
+[llvm]
+# The whole point: static archives, so the linker resolves from rustc's 638
+# LLVM roots and never pulls ORC, CodeView, PDB or the object readers.
+link-shared = false
+# Do not fetch rust's own prebuilt LLVM -- we are supplying one.
+download-ci-llvm = false
+
+[build]
+target = ["$TRIPLE"]
+host = ["$TRIPLE"]
+# Nothing here needs the docs, and building them is a large part of a full
+# bootstrap.
+docs = false
+extended = false
+
+[target.$TRIPLE]
+llvm-config = "$LLVM/bin/llvm-config"
+
+[rust]
+# LLVM is special and is always built and distributed; this is not a choice.
+codegen-backends = ["llvm"]
+# Debug info in the compiler itself is worth tens of MB and nothing here reads
+# a rustc backtrace.
+debug = false
+EOF
+  say "wrote $cfg"
+  sed 's/^/  /' "$cfg"
+}
+
+cmd_build() {
+  [ -f "$SRC/bootstrap.toml" ] || die "not configured -- run '$0 configure'"
+  say "building (this takes hours: stage0 is downloaded, then std twice)"
+  ( cd "$SRC" && ./x build )
+  say "built"
+  note "stage1 at $SRC/build/$TRIPLE/stage1"
+}
+
+cmd_measure() {
+  local out="$SRC/build/$TRIPLE/stage1"
+  [ -d "$out" ] || die "nothing built -- run '$0 build'"
+  say "this build"
+  du -sh "$out" | sed 's|/.*/|  total  |'
+  ls -l "$out"/lib/librustc_driver-*.dylib 2>/dev/null \
+    | awk '{printf "  %.1f MB  librustc_driver\n", $5/1048576}'
+  find "$out" -name 'libLLVM*.dylib' 2>/dev/null | while read -r f; do
+    ls -l "$f" | awk '{printf "  %.1f MB  %s (a separate dylib -- not expected)\n", $5/1048576, $NF}'
+  done
+
+  echo
+  say "stock, for comparison"
+  note "133.1 MB  libLLVM.dylib"
+  note " 79.2 MB  librustc_driver"
+  note "129.0 MB  std"
+  note " 30.5 MB  cargo"
+  note "390 MB    total"
+}
+
+case "${1:-}" in
+  fetch)     cmd_fetch ;;
+  configure) cmd_configure ;;
+  build)     cmd_build ;;
+  measure)   cmd_measure ;;
+  *) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac
