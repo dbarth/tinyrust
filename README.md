@@ -54,6 +54,10 @@ it. An existing rustup is never touched: its `rustup`, `cargo`, `rustc` and
 linked into `~/.cargo/bin`, which is added to your shell profile. `~/.cargo`
 itself is not our choice: cargo creates it for the registry cache regardless.
 
+trustup installs itself into `~/.rustup/toolchains/tinyrust/bin`, and every link
+in `~/.cargo/bin` points there — so the install does not depend on where it was
+run from, and deleting the checkout breaks nothing.
+
 To test the installer against a working copy rather than GitHub:
 
     TINYRUST_SOURCE=$PWD TINYRUST_DIST=$PWD/dist sh install.sh

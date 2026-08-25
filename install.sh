@@ -27,8 +27,10 @@ if [ -n "${TINYRUST_SOURCE:-}" ]; then
   TRUSTUP="$TINYRUST_SOURCE/trustup"
   say "tinyrust from $TINYRUST_SOURCE"
 else
-  dir="${TINYRUST_HOME:-$HOME/.tinyrust}"
-  mkdir -p "$dir"
+  # Only a staging copy: trustup installs itself into the toolchain, and the
+  # ~/.cargo/bin links point there, so nothing permanent lives here.
+  dir="$(mktemp -d)"
+  trap 'rm -rf "$dir"' EXIT
   say "fetching trustup from $REPO@$REF"
   curl -sSfL "$RAW/trustup" -o "$dir/trustup" || {
     echo "could not fetch $RAW/trustup" >&2; exit 1; }

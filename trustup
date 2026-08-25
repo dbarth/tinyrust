@@ -325,12 +325,20 @@ claimed() {
   [ -e "$target" ] || [ -L "$target" ] || return 1
   [ -L "$target" ] || return 0
   dest="$(readlink "$target")"
-  case "$dest" in "$p"/*|"$HERE/trustup") return 1 ;; *) return 0 ;; esac
+  case "$dest" in "$p"/*) return 1 ;; *) return 0 ;; esac
 }
 
 link_into_path() {
   local p="$1" f base
-  mkdir -p "$CARGO_BIN"
+  mkdir -p "$CARGO_BIN" "$p/bin"
+
+  # trustup installs itself into the toolchain it manages. The links below then
+  # point at that copy, so they survive the checkout being moved or deleted and
+  # do not depend on where the install was run from -- local or fetched.
+  local self; self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  if [ "$self" != "$p/bin/trustup" ]; then
+    install -m 755 "$self" "$p/bin/trustup"
+  fi
   # rustup owns cargo/rustc/rustdoc shims in this same directory. Replacing
   # them would silently repoint somebody's existing toolchain at ours, so a
   # name that is already taken by something that is not one of our symlinks is
@@ -344,7 +352,7 @@ link_into_path() {
       ln -sf "$f" "$CARGO_BIN/$base"
     fi
   done
-  claimed "$CARGO_BIN/trustup" "$p" || ln -sf "$HERE/trustup" "$CARGO_BIN/trustup"
+
 
   # `rustup` as an alias for trustup, so muscle memory and any script that
   # calls rustup keep working. Never over a real rustup: if one is already
@@ -352,7 +360,7 @@ link_into_path() {
   if claimed "$CARGO_BIN/rustup" "$p"; then
     note "left the existing rustup in $CARGO_BIN alone -- use 'trustup'"
   else
-    ln -sf "$HERE/trustup" "$CARGO_BIN/rustup"
+    ln -sf "$p/bin/trustup" "$CARGO_BIN/rustup"
   fi
   note "linked into $CARGO_BIN"
 
