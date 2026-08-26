@@ -119,6 +119,48 @@ print(m.group(1))
 PY
 }
 
+# Tens of megabytes over a link of unknown speed: silence reads as a hang.
+# curl's own -# bar redraws from column 0, so it cannot carry a label; this
+# draws one instead, from a HEAD for the total and the partial file for the
+# progress. Falls back to a bare spinner if the server gives no length, and to
+# nothing at all when stdout is not a terminal, so logs stay readable.
+BAR='##############################'   # 30
+download() {
+  local label="$1" url="$2" out="$3" total now pct n pid rc=0
+
+  if [ ! -t 1 ]; then
+    curl -sSfL -o "$out" "$url"; return
+  fi
+
+  total="$(curl -sSfLI "$url" 2>/dev/null \
+           | awk 'tolower($1)=="content-length:"{print $2+0}' | tail -1)"
+  : "${total:=0}"
+
+  curl -sSfL -o "$out" "$url" & pid=$!
+  n=0
+  while kill -0 "$pid" 2>/dev/null; do
+    now=$(stat -f%z "$out" 2>/dev/null || echo 0)
+    if [ "$total" -gt 0 ]; then
+      pct=$(( now * 100 / total )); [ "$pct" -gt 100 ] && pct=100
+      n=$(( pct * ${#BAR} / 100 ))
+    else
+      pct=0; n=$(( (n + 1) % ${#BAR} ))
+    fi
+    printf '\r  %-16s [%-*s] %3d%%' "$label" "${#BAR}" "${BAR:0:n}" "$pct"
+    sleep 0.2
+  done
+  wait "$pid" || rc=$?
+  return $rc
+}
+
+# Replaces the progress line with the result. The padding exists only to cover
+# whatever the bar left behind, so it is dropped when there was no bar.
+ok() {
+  if [ -t 1 ]; then printf '\r  [ok] %-16s %5s MB%-20s\n' "$1" "$2" ""
+  else              printf '  [ok] %-16s %5s MB\n' "$1" "$2"
+  fi
+}
+
 fetch_component() {
   local pkg="$1" triple="$2" mf="$3" dest="$4" work="$5" prune="${6:-yes}"
   local url hash tarball got
@@ -127,8 +169,8 @@ fetch_component() {
   hash="$(manifest_field "$pkg" "$triple" xz_hash "$mf")"
   tarball="$work/$(basename "$url")"
 
-  note "$pkg"
-  curl -sSfL -o "$tarball" "$url" || die "could not download $url"
+  download "$pkg" "$url" "$tarball" || die "could not download $url"
+  local dl; dl="$(mb "$tarball")"
 
   # Verified here rather than trusted: this is the one thing rustup does that
   # a plain download does not.
@@ -153,6 +195,8 @@ fetch_component() {
   # recovered from the files afterwards: which components were asked for.
   grep -qxF "$pkg" "$dest/.trustup-components" 2>/dev/null \
     || printf '%s\n' "$pkg" >> "$dest/.trustup-components"
+
+  ok "$pkg" "$dl"
 }
 
 cmd_install_direct() {
