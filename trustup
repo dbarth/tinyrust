@@ -341,7 +341,7 @@ check_shims() {
   [ -z "${RUSTUP_HOME:-}" ] || return 0
   note "cargo here is a rustup shim and RUSTUP_HOME is unset -- it will not run."
   note "  . \"\$HOME/.cargo/env\"      for this shell"
-  note "  trustup standalone         to stop going through rustup"
+  note "  trustup go tiny            to stop going through rustup"
 }
 
 cmd_version() {
@@ -688,6 +688,14 @@ INNER
     if ! grep -qF "[pkg.$pkg.target." "$mf" && grep -qF "[pkg.$pkg-preview.target." "$mf"; then
       pkg="$pkg-preview"
     fi
+    # Not everything with a name is a component. rustdoc ships inside rustc,
+    # and rustc and cargo are the toolchain -- refusing those as "unsafe to
+    # take from upstream" is true but beside the point when they are already
+    # here. rustup answers the same request with "does not contain component".
+    if [ -x "$p/bin/$pkg" ]; then
+      note "$pkg is already here -- it ships inside the toolchain, not as a component"
+      continue
+    fi
     if grep -qF "[pkg.$pkg.target.$triple]" "$mf"; then
       FROM="$channel" fetch_component "$pkg" "$triple" "$mf" "$p" "$work" no
     elif [ "$DIST" != "https://static.rust-lang.org/dist" ] && \
@@ -766,9 +774,15 @@ case "${1:-}" in
   target)    shift; cmd_target "$@" ;;
   update)    shift; cmd_update "$@" ;;
 
-  # Not passed through: printing rustup's help would fetch 10 MB of rustup to
-  # do it, and this says plainly that everything else goes there anyway.
-  ""|-h|--help|help) cmd_help ;;
+  # A bare invocation gets our summary, whatever we are called: printing
+  # rustup's help would fetch 10 MB of rustup to do it, and ours says where
+  # everything else goes. `rustup help` is an explicit request for the real
+  # thing, so it gets the real thing.
+  ""|-h|--help|help)
+    if [ -n "${1:-}" ] && [ "$(basename "$0")" = rustup ]
+    then passthrough "$@"
+    else cmd_help
+    fi ;;
 
   *) passthrough "$@" ;;
 esac
