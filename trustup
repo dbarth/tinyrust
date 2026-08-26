@@ -410,6 +410,24 @@ cmd_info() {
     if [ -n "$free_t" ]; then row "" "${free_t# }"; fi
   fi
 
+  # Anything under $ROOT that is not the toolchain: rustup itself, whatever it
+  # installed, its download cache. Only worth naming when it is worth removing,
+  # and `trim` is what removes it.
+  if [ "$(( tot - $(mb "$q") ))" -ge 10 ]; then
+    local d n extra=""
+    for d in "$ROOT"/cargo "$ROOT"/rustup/toolchains/* \
+             "$ROOT"/rustup/downloads "$ROOT"/rustup/tmp; do
+      # -L skips the tinyrust symlink rustup keeps beside its own toolchains.
+      { [ -d "$d" ] && [ ! -L "$d" ]; } || continue
+      n="$(mb "$d")"
+      [ "$n" -ge 1 ] || continue
+      case "$d" in
+        "$ROOT"/cargo) extra="$extra, rustup $n MB" ;;
+        *)             extra="$extra, $(basename "$d") $n MB" ;;
+      esac
+    done
+    if [ -n "$extra" ]; then row extra "${extra#, }"; fi
+  fi
   check_shims
 }
 
