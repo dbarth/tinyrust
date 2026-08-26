@@ -13,7 +13,7 @@
 # the linker. For rustc the result is what a two-target LLVM would have given,
 # because each backend lives in its own set of archives.
 #
-# See PLAN-rustc.md.
+# See NOTES.md.
 set -euo pipefail
 
 REAL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/llvm-config.real"

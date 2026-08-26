@@ -1,6 +1,6 @@
 # tinyrust
 
-Tinyrust will install the smallest Rust environment on macOS.
+Tinyrust is the smallest Rust install for macOS. Get started faster and leaner.
 
 
 ## Get it
@@ -11,7 +11,7 @@ Tinyrust will install the smallest Rust environment on macOS.
 
 The standard Rust distribution is a 1.4GB install, before you even start compiling and adding dependencies.
 
-Tinyrust brings that down to 262MB, an 81% reduction, to get started faster and leaner.
+Tinyrust brings that down to 262MB, an 81% reduction.
 
 You still get the full rustup/cargo support, so you can add components or
 dependencies as usual:
@@ -19,7 +19,8 @@ dependencies as usual:
     rustup component add rust-analyzer-preview
     cargo add serde
 
-If you later need more build targets or different build options, you can easily switch to the fuller distribution toolchain with:
+If you later need more build targets or different build options, you can easily switch
+to the standard toolchain distribution with:
 
     trustup install --rustup
 
@@ -30,7 +31,7 @@ If you later need more build targets or different build options, you can easily 
     cargo new hello && cd hello && cargo run --release
 
 The installer fetches the optimized toolchain and sets up the environment for building.
- - no prompt, one profile: the small one. 
+ - no prompt, a single profile: the tiny one. 
  - installs to `~/.rustup/toolchains/tinyrust`,
  - links into `~/.cargo/bin`,
  - adds that to your shell profile.
@@ -127,7 +128,7 @@ And the rest:
 
 # Development
 
-Not needed to use tinyrust. `PLAN-rustc.md` has the derivations.
+Not needed to use tinyrust. `NOTES.md` has the derivations.
 
     ./build-rustc llvm           # wasmer's LLVM, pruned: 457 MB -> 768 MB kept
     ./build-rustc fetch          # rust 1.98.0 + cargo submodule

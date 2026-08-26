@@ -15,14 +15,14 @@
 #   build-rustc dist       package components + manifest for trustup to install
 #   build-rustc measure    compare the result against the stock toolchain
 #
-# See PLAN-rustc.md for why this should work and what it cannot fix.
+# See NOTES.md for why this should work and what it cannot fix.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LLVM="${TINYRUST_LLVM:-$HERE/llvm}"
 SRC="$HERE/rust"
 
-# The version the measurements in PLAN-rustc.md were taken against, so the
+# The version the measurements in NOTES.md were taken against, so the
 # comparison is like for like. Its LLVM is 22.1.8, which is what ./llvm is.
 VERSION="${RUSTC_VERSION:-1.98.0}"
 TRIPLE="aarch64-apple-darwin"
@@ -54,7 +54,7 @@ TOOLS="${RUSTC_TOOLS:-cargo rustdoc}"
 # Built and packaged, but not installed by default -- these are components a
 # user adds. They have to be built here rather than taken from the official
 # dist because each links librustc_driver, so the official build of them is
-# tied to the official compiler. See PLAN-rustc.md.
+# tied to the official compiler. See NOTES.md.
 TOOLS_OPTIONAL="${RUSTC_TOOLS_OPTIONAL:-clippy rustfmt rust-analyzer miri}"
 # Of the 14 binaries in the llvm-tools component (205 MB), these are kept.
 # cargo shells out to rust-objcopy to honour `strip` in release profiles.
@@ -72,7 +72,7 @@ note() { printf '  %s\n' "$*"; }
 die()  { printf 'build-rustc: %s\n' "$*" >&2; exit 1; }
 
 check_llvm() {
-  [ -x "$LLVM/bin/llvm-config" ] || die "no llvm-config in $LLVM -- see PLAN-rustc.md"
+  [ -x "$LLVM/bin/llvm-config" ] || die "no llvm-config in $LLVM -- see NOTES.md"
   note "llvm     $("$LLVM/bin/llvm-config" --version)"
   note "targets  $("$LLVM/bin/llvm-config" --targets-built)$([ -f "$LLVM/bin/llvm-config.real" ] && echo "  (restricted from: $("$LLVM/bin/llvm-config.real" --targets-built))")"
   note "static   $([ -z "$(find "$LLVM/lib" -name 'libLLVM*.dylib' 2>/dev/null)" ] && echo yes || echo 'no -- expected archives')"
@@ -212,7 +212,7 @@ cmd_configure() {
   local cfg="$SRC/bootstrap.toml"
 
   cat > "$cfg" <<EOF
-# Written by build-rustc. See ../PLAN-rustc.md.
+# Written by build-rustc. See ../NOTES.md.
 
 # Bootstrap warns without this; we track no bootstrap config changes.
 change-id = "ignore"
@@ -260,7 +260,7 @@ codegen-tests = false
 # The llvm-tools component: 14 binaries bootstrap copies into the sysroot from
 # llvm-config --bindir. Each statically links LLVM, so they are large. cargo
 # needs exactly one of them (rust-objcopy, to strip release binaries), which is
-# why this is now on -- see PLAN-rustc.md for which ones earn their place.
+# why this is now on -- see NOTES.md for which ones earn their place.
 llvm-tools = ${LLVM_TOOLS:-true}
 EOF
   say "wrote $cfg"
