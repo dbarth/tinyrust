@@ -86,11 +86,19 @@ jobs:
           path: llvm
           key: llvm-${{ env.LLVM_VERSION }}-darwin-aarch64-v1
 
+      # A private repo's releases/download/... URL 404s even with a token --
+      # only the API asset endpoint serves it, which is what `gh release
+      # download` uses. build-rustc takes a file:// URL, so it stays unaware.
+      # Once the repo is public the plain URL works and this can go back.
       - name: fetch llvm
         if: steps.llvm-cache.outputs.cache-hit != 'true'
         env:
-          TINYRUST_LLVM_URL: https://github.com/${{ github.repository }}/releases/download/llvm-22.x/tinyrust-llvm-${{ env.LLVM_VERSION }}-darwin-aarch64.tar.xz
-        run: ./build-rustc llvm
+          GH_TOKEN: ${{ github.token }}
+          ASSET: tinyrust-llvm-${{ env.LLVM_VERSION }}-darwin-aarch64.tar.xz
+        run: |
+          gh release download llvm-22.x --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ASSET" --dir "$RUNNER_TEMP" --clobber
+          TINYRUST_LLVM_URL="file://$RUNNER_TEMP/$ASSET" ./build-rustc llvm
 
       - name: fetch rust
         run: ./build-rustc fetch
