@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 #
-# trustup -- a thin rustup wrapper for the tinyrust toolchain
+# trustup -- rustup wrapper and alias for the tinyrust toolchain
 #
-#   trustup install [DIR]     fetch the toolchain directly (default ~/.rustup)
-#   trustup info              version, toolchain, components and installed size
-#   trustup go full | tiny    switch between the full toolchain or the tiny one
-#   trustup trim              remove what `full` installed and stay tiny
-#   trustup update            tinyrust is replaced whole, not updated
+#   install [DIR]     fetch the toolchain directly (default ~/.rustup)
+#   info              version, toolchain, components and installed size
+#   go full | tiny    switch between the full toolchain or the tiny one
+#   trim              remove what `full` installed and stay tiny
+#   update            tinyrust is replaced whole, not updated
 #
 # Handles only what rustup cannot do for a linked toolchain. Specifically:
 #
-#   [t]rustup component add N | list
-#   [t]rustup target add T    | list
+#   rustup component add N | list
+#   rustup target add T    | list
 #
 # Anything else goes to rustup: toolchain, doc, run, etc.
 #
-#   [t]rustup help            the full /rustup/ command list
-#   trustup                   this help
+#   rustup help               the full /rustup/ command list
+#   rustup                    this help
 #
 # The toolchain goes to ~/.rustup/toolchains/tinyrust -- rustup's own layout, so
 # the two coexist -- and its binaries are linked into ~/.cargo/bin, which is
@@ -362,21 +362,49 @@ cmd_info() {
     note "no toolchain installed -- run '$(basename "$0") install'"
     return
   fi
-  note "toolchain   $("$q/bin/rustc" --version 2>/dev/null)"
-  note "at          $q"
+  row() { printf '  %-12s %s\n' "$1" "$2"; }
 
-  # .trustup-components records what was asked for. The three every install
-  # brings are not in it, so name them rather than print a misleading subset.
-  local c; c="$(tr '\n' ' ' < "$q/.trustup-components" 2>/dev/null)"
-  note "components  ${c:-rustc rust-std cargo }"
+  row toolchain "$("$q/bin/rustc" --version 2>/dev/null | awk '{print $2}') at $q"
 
-  local d targets=""
+  local d have_t=""
   for d in "$q"/lib/rustlib/*/lib; do
     [ -d "$d" ] || continue
-    d="${d%/lib}"; targets="$targets $(basename "$d")"
+    d="${d%/lib}"; have_t="$have_t $(basename "$d")"
   done
-  note "targets    $targets"
-  note "size        $(mb "$q") MB toolchain, $(mb "$ROOT") MB under $ROOT"
+  row targets "${have_t# }"
+
+  local have_c; have_c="$(tr '\n' ' ' < "$q/.trustup-components" 2>/dev/null)"
+  local show="${have_c:-rustc rust-std cargo}"; row installed "${show% }"
+
+  # What the dist offers that is not here yet. This needs the manifest, so it
+  # is the one part that touches the network; a failure drops the line rather
+  # than the command.
+  local work; work="$(mktemp -d)"
+  trap 'rm -rf "$work"' RETURN
+  local channel; channel="$(cat "$q/.trustup-channel" 2>/dev/null || echo "$CHANNEL")"
+  local mf="$work/channel.toml"
+  if curl -sSfL -o "$mf" "$DIST/channel-rust-$channel.toml" 2>/dev/null; then
+    local triple; triple="$(host_triple)"
+    local pkg free_c="" free_t=""
+    for pkg in $(grep -o "^\[pkg\.[^.]*\.target\.$triple\]" "$mf" \
+                 | sed "s/^\[pkg\.//; s/\.target\..*//"); do
+      case " $have_c " in *" $pkg "*) ;; *) free_c="$free_c $pkg" ;; esac
+    done
+    for pkg in $(grep -o '^\[pkg\.rust-std\.target\.[^]]*\]' "$mf" \
+                 | sed 's/^\[pkg\.rust-std\.target\.//; s/\]$//'); do
+      case " $have_t " in *" $pkg "*) ;; *) free_t="$free_t $pkg" ;; esac
+    done
+    # `if`, not `&&`: a trailing && list that fails is the shape that has
+    # silently aborted functions here before.
+    if [ -n "$free_c" ]; then row available "${free_c# }"; fi
+    if [ -n "$free_t" ]; then row "" "${free_t# }"; fi
+  fi
+
+  local tot; tot="$(mb "$ROOT")"
+  if [ "$tot" = "$(mb "$q")" ]
+  then row size "$tot MB"
+  else row size "$(mb "$q") MB toolchain, $tot MB under $ROOT"
+  fi
   check_shims
 }
 
