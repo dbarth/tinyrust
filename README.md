@@ -19,11 +19,19 @@ dependencies as usual:
     rustup component add rust-analyzer-preview
     cargo add serde
 
-If you later need more build targets or different build options, add the full
-official toolchain beside it and let rustup decide which one runs:
+If you want the full standard install, add it beside this one:
 
     trustup toolchain add
-    rustup default tinyrust      # back to the small one
+
+That fetches the official toolchain through rustup and makes it the default.
+Both stay installed, and rustup switches between them:
+
+    rustup default tinyrust
+    rustup default stable
+
+To drop rustup out of the path entirely and have tinyrust run directly again:
+
+    trustup standalone
 
 
 ## Use it
@@ -52,6 +60,7 @@ Note: an existing rustup is never touched — its shims are left alone and you u
 | `trustup size` | where the bytes are |
 | `trustup version` | this, and the toolchain it manages |
 | `trustup toolchain add` | the full official toolchain, beside this one |
+| `trustup standalone` | stop going through rustup, tinyrust drives again |
 | `component add\|list`, `target add\|list`, `update` | intercepted: rustup refuses these on a linked toolchain |
 | anything else | passed to rustup, fetched on first use |
 

@@ -6,6 +6,8 @@
 #   trustup list              what is installed, and what else is on offer
 #   trustup size              where the bytes are
 #   trustup version           this, and the toolchain it manages
+#   trustup toolchain add     the full official toolchain, beside this one
+#   trustup standalone        stop going through rustup, tinyrust drives
 #
 # Handles only what rustup cannot do for a linked toolchain. Specifically:
 #
@@ -327,6 +329,20 @@ upstream_is_independent() {
 
 # What this is, and what it is managing. Both, because the version of trustup
 # says nothing about the toolchain it installed.
+# A shimmed cargo needs RUSTUP_HOME, and rustup lives nested where it will not
+# look. In a shell that never sourced ~/.cargo/env, `cargo` then dies with a
+# rustup error that names neither cause nor cure.
+check_shims() {
+  case "$(readlink "$CARGO_BIN/cargo" 2>/dev/null)" in
+    "$ROOT"/cargo/bin/*) ;;
+    *) return 0 ;;
+  esac
+  [ -z "${RUSTUP_HOME:-}" ] || return 0
+  note "cargo here is a rustup shim and RUSTUP_HOME is unset -- it will not run."
+  note "  . \"\$HOME/.cargo/env\"      for this shell"
+  note "  trustup standalone         to stop going through rustup"
+}
+
 cmd_version() {
   local q; q="$(prefix 2>/dev/null)" || q=""
   echo "trustup $TRUSTUP_VERSION"
@@ -335,6 +351,7 @@ cmd_version() {
   else
     echo "no toolchain installed"
   fi
+  check_shims
 }
 
 # rustup reports "no updatable toolchains installed" for a linked toolchain,
@@ -400,6 +417,29 @@ hand_over() {
   note "pointed $CARGO_BIN at rustup's shims"
 }
 
+# The inverse of hand_over. After `toolchain add`, ~/.cargo/bin points at
+# rustup's shims for good: a reinstall will not take them back, because
+# claimed() cannot tell a shim we made from a foreign rustup's. This says
+# plainly that tinyrust drives again. rustup and the full toolchain stay
+# installed -- `trustup toolchain add` hands the wheel back.
+cmd_standalone() {
+  local q f base; q="$(prefix)"
+  # Agree with rustup rather than contradict it: with direct links, `rustup
+  # default` stops deciding anything, so leave it pointing where we point.
+  if [ -x "$ROOT/cargo/bin/rustup" ]; then
+    RUSTUP_HOME="$ROOT/rustup" "$ROOT/cargo/bin/rustup" default tinyrust >/dev/null 2>&1 || true
+  fi
+  for f in "$q"/bin/*; do
+    [ -x "$f" ] || continue
+    base="$(basename "$f")"
+    case "$base" in trustup) continue ;; esac
+    ln -sf "$f" "$CARGO_BIN/$base"
+  done
+  say "tinyrust drives $CARGO_BIN again"
+  note "rustup and anything it installed are untouched"
+  note "trustup toolchain add    hands it back"
+}
+
 # `install` gives you tinyrust. This adds the official toolchain beside it and
 # hands rustup the wheel. tinyrust stays linked, so switching back is free.
 cmd_toolchain() {
@@ -427,7 +467,7 @@ cmd_toolchain() {
 }
 
 cmd_help() {
-  sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Interception is right only while tinyrust is the toolchain rustup would run.
@@ -673,6 +713,7 @@ case "${1:-}" in
   install)   shift; [ $# -eq 0 ] || ROOT="$1"; cmd_install_direct ;;
   list)      cmd_component list ;;
   size)      cmd_size ;;
+  standalone) cmd_standalone ;;
   version)   cmd_version ;;
 
   # rustup refuses these on a linked toolchain, or answers with nothing
