@@ -2,15 +2,18 @@
 #
 # trustup -- a thin rustup wrapper, installing the tinyrust toolchain
 #
-#   trustup install [DIR]     fetch components directly (default ~/.rustup)
-#   trustup install --rustup  drive rustup, then delete what it over-installed
-#   trustup trim              remove what a build never reads (--rustup only)
-#   trustup component list    what is installed, and what else is on offer
-#   trustup component add N   add one, from this dist or the official one
+#   trustup install [DIR]     fetch the toolchain directly (default ~/.rustup)
+#   trustup list              what is installed, and what else is on offer
 #   trustup size              where the bytes are
-#   trustup env               shell lines to use it
-#   trustup --version         what this is and which toolchain it manages
-#   trustup <anything else>   passed to rustup, fetched on first use
+#   trustup version           this, and the toolchain it manages
+#
+# Handles only what rustup cannot do for a linked toolchain. Specifically:
+#
+#   component add N | list
+#   target add T    | list
+#   update                    tinyrust is replaced whole, not updated
+#
+# Anything else goes to rustup: show, which, toolchain, default, doc, run.
 #
 # The toolchain goes to ~/.rustup/toolchains/tinyrust -- rustup's own layout, so
 # the two coexist -- and its binaries are linked into ~/.cargo/bin, which is
@@ -52,6 +55,7 @@ DIST="${TRUSTUP_DIST:-https://github.com/dbarth/tinyrust/$RELEASE_PATH}"
 case "$DIST" in */|*://*) ;; *) DIST="file://$DIST" ;; esac
 
 # macOS ships bash 3.2, which has no $'\uXXXX'; these are the UTF-8 bytes.
+TRUSTUP_VERSION="0.1.0"
 TICK=$(printf '\342\234\223')
 DOWNLOADED_B=0
 # what `rustup` costs by default
@@ -284,45 +288,6 @@ cmd_install_direct() {
   echo
 }
 
-# ---- rustup: the old way, kept for comparison ------------------------------
-
-cmd_install_rustup() {
-  # The real thing in its real places. $CHANNEL is a tinyrust channel name and
-  # means nothing to rustup, so the toolchain is named separately.
-  export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-  local toolchain="${RUSTUP_TOOLCHAIN:-stable}"
-  local triple; triple="$(host_triple)"
-  say "installing $toolchain via rustup for $triple"
-  mkdir -p "$RUSTUP_HOME"
-  local init="$RUSTUP_HOME/rustup-init.sh"
-  [ -f "$init" ] || curl -sSfL "https://sh.rustup.rs" -o "$init"
-
-  # --profile minimal is the only knob that matters here: rustc + cargo +
-  # rust-std and nothing else. The default profile adds rust-docs.
-  sh "$init" -y --no-modify-path --profile minimal \
-     --default-toolchain "$toolchain" --default-host "$triple" >/dev/null
-
-  note "installed: $(mb "$RUSTUP_HOME") MB"
-  say "now run: $0 trim"
-}
-
-# Only meaningful after --rustup: the direct install never writes these.
-cmd_trim() {
-  local tc; tc="$(echo "$ROOT"/rustup/toolchains/*/)"
-  [ -d "$tc" ] || die "trim applies to a --rustup install; the direct one skips these already"
-  local before; before="$(mb "$ROOT")"
-
-  say "trimming $tc"
-  for path in "$tc/bin/rustdoc" "$tc/share/doc" \
-              "$tc/lib/rustlib/"*/bin/wasm-component-ld \
-              "$tc"/lib/librustc-*_rt.*; do
-    [ -e "$path" ] || continue
-    note "$(basename "$path") -- $(mb "$path") MB"
-    rm -rf "$path"
-  done
-  say "$before MB -> $(mb "$ROOT") MB"
-}
-
 # ---- adding a component ----------------------------------------------------
 
 # `rustup component add` and `component list`, for an install that has no
@@ -360,28 +325,120 @@ upstream_is_independent() {
        reinstall the toolchain to drop what was just unpacked."
 }
 
-# Invoked as `rustup` this must not pretend to be rustup. Say what it is, what
-# toolchain it manages, and how to get the real thing.
-cmd_identity() {
-  # `|| true` has to sit outside the substitution: prefix dies with exit, which
-  # ends the subshell before any `|| true` inside it could run.
-  local p; p="$(prefix 2>/dev/null)" || p=""
-  # the program identity
-  sed -n '3,3p' "$0" | sed 's/^# \{0,1\}//'
-  if [ -n "$p" ] && [ -x "$p/bin/rustc" ]; then
-    note "toolchain  $("$p/bin/rustc" --version 2>/dev/null) at $p"
-    note "size       $(mb "$p") MB"
+# What this is, and what it is managing. Both, because the version of trustup
+# says nothing about the toolchain it installed.
+cmd_version() {
+  local q; q="$(prefix 2>/dev/null)" || q=""
+  echo "trustup $TRUSTUP_VERSION"
+  if [ -n "$q" ] && [ -x "$q/bin/rustc" ]; then
+    echo "$("$q/bin/rustc" --version 2>/dev/null) at $q"
   else
-    note "toolchain  none installed"
+    echo "no toolchain installed"
   fi
-  echo
-  note "this is not rustup. Commands it does not handle are passed through to"
-  note "the real one, fetched on demand. For the full official toolchain:"
-  note "  trustup install --rustup"
+}
+
+# rustup reports "no updatable toolchains installed" for a linked toolchain,
+# which is true and useless. Named toolchains are its business, so those pass
+# through; a bare `update` is about tinyrust, and tinyrust is replaced whole.
+cmd_update() {
+  if [ $# -gt 0 ]; then passthrough update "$@"; fi
+  say "tinyrust has no in-place update"
+  note "reinstall to move to the current release:"
+  note "  trustup install"
+}
+
+# A target is a component to rustup, so it refuses these on a linked toolchain
+# exactly as it refuses `component add`. Ours are plain rust-std packages.
+cmd_target() {
+  local verb="${1:-list}"; shift || true
+  ours_is_active || passthrough target "$verb" "$@"
+  case "$verb" in
+    add|list) ;;
+    *) passthrough target "$verb" "$@" ;;
+  esac
+  local q; q="$(prefix)"
+  local work; work="$(mktemp -d)"
+  trap 'rm -rf "$work"' RETURN
+  local channel; channel="$(cat "$q/.trustup-channel" 2>/dev/null || echo "$CHANNEL")"
+  local mf="$work/channel.toml"
+  curl -sSfL -o "$mf" "$DIST/channel-rust-$channel.toml" \
+    || die "could not fetch the $channel manifest"
+
+  if [ "$verb" = list ]; then
+    say "targets on $channel"
+    local tr
+    for tr in $(grep -o '^\[pkg\.rust-std\.target\.[^]]*\]' "$mf" \
+                | sed 's/^\[pkg\.rust-std\.target\.//; s/\]$//'); do
+      if [ -d "$q/lib/rustlib/$tr/lib" ]; then note "$tr  (installed)"; else note "$tr"; fi
+    done
+    return
+  fi
+
+  [ $# -gt 0 ] || die "target add needs a triple -- 'trustup target list' shows them"
+  local tr
+  for tr in "$@"; do
+    grep -qF "[pkg.rust-std.target.$tr]" "$mf" \
+      || die "no rust-std for $tr in this dist -- 'trustup target list' shows what there is"
+    FROM="$channel" fetch_component rust-std "$tr" "$mf" "$q" "$work" no
+  done
+  say "now: $(mb "$q") MB"
+}
+
+# ---- handing over to rustup ------------------------------------------------
+
+# Until now ~/.cargo/bin pointed straight at tinyrust's binaries, which bypass
+# rustup entirely -- `rustup default` would decide nothing. Repoint them at
+# rustup's shims so it does. `rustup` and `trustup` are left alone: switching
+# back to tinyrust means needing the interception again.
+hand_over() {
+  local f base
+  for f in "$ROOT"/cargo/bin/*; do
+    base="$(basename "$f")"
+    case "$base" in rustup|trustup) continue ;; esac
+    ln -sf "$f" "$CARGO_BIN/$base"
+  done
+  note "pointed $CARGO_BIN at rustup's shims"
+}
+
+# `install` gives you tinyrust. This adds the official toolchain beside it and
+# hands rustup the wheel. tinyrust stays linked, so switching back is free.
+cmd_toolchain() {
+  local verb="${1:-list}"; shift || true
+  [ "$verb" = add ] || passthrough toolchain "$verb" "$@"
+  local name="${1:-stable}"
+
+  ensure_rustup toolchain
+  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
+  local before; before="$(mb "$ROOT")"
+  say "adding $name -- the full official toolchain, via rustup"
+  "$CARGO_HOME/bin/rustup" toolchain install "$name" \
+    || die "rustup could not install $name"
+  "$CARGO_HOME/bin/rustup" default "$name" >/dev/null \
+    || die "rustup could not make $name the default"
+
+  hand_over
+  # At install time there was no rustup, so the env file has no RUSTUP_HOME.
+  write_cargo_env
+  total "$name added:" "$(( $(mb "$ROOT") - before ))" "(now $(mb "$ROOT") MB total)"
+  say "rustup decides from here:"
+  note "rustup default tinyrust    back to the small one"
+  note "rustup default $name    the full one"
+  note "open a new shell, or: . \"\$HOME/.cargo/env\""
 }
 
 cmd_help() {
- sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# Interception is right only while tinyrust is the toolchain rustup would run.
+# Once a real one is the default, components are rustup's business again --
+# quietly adding them to tinyrust instead would be a wrong answer, not a
+# smaller one.
+ours_is_active() {
+  [ -x "$ROOT/cargo/bin/rustup" ] || return 0          # no rustup: all ours
+  local d
+  d="$(RUSTUP_HOME="$ROOT/rustup" "$ROOT/cargo/bin/rustup" default 2>/dev/null)" || return 0
+  case "$d" in tinyrust*|"") return 0 ;; *) return 1 ;; esac
 }
 
 passthrough() {
@@ -425,6 +482,17 @@ ensure_rustup() {                         # ensure_rustup <verb, for the message
 # upgrade replaces the toolchain and the links keep pointing at it.
 # True when a path exists and is not ours: either a real file, or a symlink
 # pointing somewhere other than this toolchain or this trustup.
+# PATH, plus the home rustup's shims cannot infer because rustup lives nested
+# under $ROOT. Without the second line a shimmed `cargo` says "no default".
+write_cargo_env() {
+  mkdir -p "$HOME/.cargo"
+  printf '#!/bin/sh\ncase ":$PATH:" in *":%s:"*) ;; *) PATH="%s:$PATH"; export PATH ;; esac\n' \
+    "$CARGO_BIN" "$CARGO_BIN" > "$HOME/.cargo/env"
+  if [ -d "$ROOT/rustup" ]; then
+    printf 'RUSTUP_HOME="%s"; export RUSTUP_HOME\n' "$ROOT/rustup" >> "$HOME/.cargo/env"
+  fi
+}
+
 claimed() {
   local target="$1" p="$2" dest
   [ -e "$target" ] || [ -L "$target" ] || return 1
@@ -472,8 +540,7 @@ link_into_path() {
   note "linked into $CARGO_BIN"
 
   local line=". \"\$HOME/.cargo/env\""
-  printf '#!/bin/sh\ncase ":$PATH:" in *":%s:"*) ;; *) PATH="%s:$PATH"; export PATH ;; esac\n' \
-    "$CARGO_BIN" "$CARGO_BIN" > "$HOME/.cargo/env"
+  write_cargo_env
   local rc
   for rc in "$HOME/.zshenv" "$HOME/.bashrc" "$HOME/.profile"; do
     [ -e "$rc" ] || continue
@@ -485,6 +552,7 @@ link_into_path() {
 
 cmd_component() {
   local verb="${1:-list}"; shift || true
+  ours_is_active || passthrough component "$verb" "$@"
   case "$verb" in
     add|list) ;;
     *) die "component takes 'add' or 'list', not '$verb'" ;;
@@ -492,15 +560,6 @@ cmd_component() {
   [ "$verb" = add ] && [ $# -eq 0 ] && die "component add needs a name -- '$0 component list' shows them"
 
   local p; p="$(prefix)"
-
-  # A --rustup install lets rustup own the toolchain, so components are its
-  # business. A direct install is ours even when a rustup exists alongside it --
-  # passthrough installs one on first use, and it manages a *linked* toolchain
-  # that has no components of its own.
-  if [ ! -f "$p/.trustup-components" ] && [ -d "$ROOT/rustup" ]; then
-    export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
-    exec "$CARGO_HOME/bin/rustup" component "$verb" "$@"
-  fi
 
   local triple; triple="$(host_triple)"
   local channel; channel="$(cat "$p/.trustup-channel" 2>/dev/null || echo "$CHANNEL")"
@@ -605,31 +664,26 @@ cmd_size() {
   du -sh "$p/bin" 2>/dev/null | sed 's|/.*/|  |'
 }
 
-cmd_env() {
-  local p; p="$(prefix)"
-  if [ -d "$ROOT/rustup" ]; then
-    echo "export RUSTUP_HOME=\"$ROOT/rustup\""
-    echo "export CARGO_HOME=\"$ROOT/cargo\""
-    echo "export PATH=\"$ROOT/cargo/bin:\$PATH\""
-  else
-    # No rustup, so no proxy shims: the binaries are on PATH directly, and
-    # cargo finds rustc there. CARGO_HOME is only where the registry cache and
-    # any `cargo install` binaries go.
-    echo "export CARGO_HOME=\"$ROOT/cargo-home\""
-    echo "export PATH=\"$p/bin:\$PATH\""
-  fi
-}
 
+# Invoked as `rustup` this is a stand-in and stays out of the way; invoked as
+# `trustup` it is itself. Either way the rule is the same: handle only what
+# rustup cannot do for a linked toolchain, and hand it everything else.
 case "${1:-}" in
-  install)
-    shift
-    if [ "${1:-}" = "--rustup" ]; then shift; [ $# -eq 0 ] || ROOT="$1"; cmd_install_rustup
-    else [ $# -eq 0 ] || ROOT="$1"; cmd_install_direct; fi ;;
+  # ours
+  install)   shift; [ $# -eq 0 ] || ROOT="$1"; cmd_install_direct ;;
+  list)      cmd_component list ;;
+  size)      cmd_size ;;
+  version)   cmd_version ;;
+
+  # rustup refuses these on a linked toolchain, or answers with nothing
   component) shift; cmd_component "$@" ;;
-  trim) cmd_trim ;;
-  size) cmd_size ;;
-  env)  cmd_env ;;
+  target)    shift; cmd_target "$@" ;;
+  update)    shift; cmd_update "$@" ;;
+  toolchain) shift; cmd_toolchain "$@" ;;
+
+  # Not passed through: printing rustup's help would fetch 10 MB of rustup to
+  # do it, and this says plainly that everything else goes there anyway.
   ""|-h|--help|help) cmd_help ;;
-  -V|--version|version) cmd_identity ;;
+
   *) passthrough "$@" ;;
 esac

@@ -19,10 +19,11 @@ dependencies as usual:
     rustup component add rust-analyzer-preview
     cargo add serde
 
-If you later need more build targets or different build options, you can easily switch
-to the standard toolchain distribution with:
+If you later need more build targets or different build options, add the full
+official toolchain beside it and let rustup decide which one runs:
 
-    trustup install --rustup
+    trustup toolchain add
+    rustup default tinyrust      # back to the small one
 
 
 ## Use it
@@ -38,22 +39,20 @@ The installer fetches the optimized toolchain and sets up the environment for bu
  
 It contains `trustup`, ie "tiny rustup". `rustup` is aliased to `trustup` but does not pretend to be it:
 
-    $ rustup --version
-    trustup -- a thin rustup wrapper, installing a tinyrust toolchain
-      toolchain  rustc 1.98.0-dev at ~/.rustup/toolchains/tinyrust
-      this is not rustup. Commands it does not handle are passed through to
-      the real one, fetched on demand. For the full official toolchain:
-        trustup install --rustup
+    $ rustup version
+    trustup 0.1.0
+    rustc 1.98.0-dev at ~/.rustup/toolchains/tinyrust
 
 Note: an existing rustup is never touched — its shims are left alone and you use `trustup` by name.
 
 | | |
 |---|---|
-| `trustup install [DIR]` | fetch components, no rustup |
-| `trustup install --rustup` | drive rustup, then trim what it over-installed |
-| `trustup component list\|add` | resolve against the manifest |
+| `trustup install [DIR]` | fetch the toolchain, no rustup |
+| `trustup list` | what is installed, and what else is on offer |
 | `trustup size` | where the bytes are |
-| `trustup env` | shell lines to use it, if you skipped the profile edit |
+| `trustup version` | this, and the toolchain it manages |
+| `trustup toolchain add` | the full official toolchain, beside this one |
+| `component add\|list`, `target add\|list`, `update` | intercepted: rustup refuses these on a linked toolchain |
 | anything else | passed to rustup, fetched on first use |
 
 `component add` resolves three ways and never mixes silently:
