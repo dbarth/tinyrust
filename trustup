@@ -3,20 +3,20 @@
 # trustup -- a thin rustup wrapper for the tinyrust toolchain
 #
 #   trustup install [DIR]     fetch the toolchain directly (default ~/.rustup)
-#   trustup list              what is installed, and what else is on offer
-#   trustup size              where the bytes are
-#   trustup version           this, and the toolchain it manages
-#   trustup go full           the full official toolchain, docs and all
-#   trustup go tiny           back to tinyrust, no rustup in the path
-#   trustup trim              remove what `go full` installed
+#   trustup info              version, toolchain, components and installed size
+#   trustup go full | tiny    switch between the full toolchain or the tiny one
+#   trustup trim              remove what `full` installed and stay tiny
+#   trustup update            tinyrust is replaced whole, not updated
 #
 # Handles only what rustup cannot do for a linked toolchain. Specifically:
 #
-#   component add N | list
-#   target add T    | list
-#   update                    tinyrust is replaced whole, not updated
+#   [t]rustup component add N | list
+#   [t]rustup target add T    | list
 #
-# Anything else goes to rustup: show, which, toolchain, default, doc, run.
+# Anything else goes to rustup: toolchain, doc, run, etc.
+#
+#   [t]rustup help            the full /rustup/ command list
+#   trustup                   this help
 #
 # The toolchain goes to ~/.rustup/toolchains/tinyrust -- rustup's own layout, so
 # the two coexist -- and its binaries are linked into ~/.cargo/bin, which is
@@ -348,20 +348,38 @@ check_shims() {
   note "  trustup go tiny            to stop going through rustup"
 }
 
-cmd_version() {
-  local q; q="$(prefix 2>/dev/null)" || q=""
-  echo "trustup $TRUSTUP_VERSION"
-  if [ -n "$q" ] && [ -x "$q/bin/rustc" ]; then
-    echo "$("$q/bin/rustc" --version 2>/dev/null) at $q"
-  else
-    echo "no toolchain installed"
-  fi
-  check_shims
-}
 
 # rustup reports "no updatable toolchains installed" for a linked toolchain,
 # which is true and useless. Named toolchains are its business, so those pass
 # through; a bare `update` is about tinyrust, and tinyrust is replaced whole.
+# One answer to "what have I got": which trustup, which compiler, what has been
+# added to it, what it can emit for, and what it costs. Replaces the separate
+# version, size and list verbs.
+cmd_info() {
+  local q; q="$(prefix 2>/dev/null)" || q=""
+  say "trustup $TRUSTUP_VERSION"
+  if [ -z "$q" ] || [ ! -x "$q/bin/rustc" ]; then
+    note "no toolchain installed -- run '$(basename "$0") install'"
+    return
+  fi
+  note "toolchain   $("$q/bin/rustc" --version 2>/dev/null)"
+  note "at          $q"
+
+  # .trustup-components records what was asked for. The three every install
+  # brings are not in it, so name them rather than print a misleading subset.
+  local c; c="$(tr '\n' ' ' < "$q/.trustup-components" 2>/dev/null)"
+  note "components  ${c:-rustc rust-std cargo }"
+
+  local d targets=""
+  for d in "$q"/lib/rustlib/*/lib; do
+    [ -d "$d" ] || continue
+    d="${d%/lib}"; targets="$targets $(basename "$d")"
+  done
+  note "targets    $targets"
+  note "size        $(mb "$q") MB toolchain, $(mb "$ROOT") MB under $ROOT"
+  check_shims
+}
+
 cmd_update() {
   if [ $# -gt 0 ]; then passthrough update "$@"; fi
   say "tinyrust has no in-place update"
@@ -747,18 +765,6 @@ prefix() {
   die "nothing installed -- run '$0 install'"
 }
 
-cmd_size() {
-  local p; p="$(prefix)"
-  say "total: $(mb "$ROOT") MB"
-  echo
-  say "irreducible without building rustc from source"
-  du -sh "$p/lib/libLLVM.dylib" "$p"/lib/librustc_driver-*.dylib 2>/dev/null \
-    | sed 's|/.*/|  |'
-  du -sh "$p/lib/rustlib/"*/lib 2>/dev/null | sed 's|/.*rustlib/|  std for |'
-  echo
-  say "the rest"
-  du -sh "$p/bin" 2>/dev/null | sed 's|/.*/|  |'
-}
 
 
 # Invoked as `rustup` this is a stand-in and stays out of the way; invoked as
@@ -767,26 +773,20 @@ cmd_size() {
 case "${1:-}" in
   # ours
   install)   shift; [ $# -eq 0 ] || ROOT="$1"; cmd_install_direct ;;
-  list)      cmd_component list ;;
-  size)      cmd_size ;;
+  info)      cmd_info ;;
   go)        shift; cmd_go "$@" ;;
   trim)      cmd_trim ;;
-  version)   cmd_version ;;
 
   # rustup refuses these on a linked toolchain, or answers with nothing
   component) shift; cmd_component "$@" ;;
   target)    shift; cmd_target "$@" ;;
   update)    shift; cmd_update "$@" ;;
 
-  # A bare invocation gets our summary, whatever we are called: printing
-  # rustup's help would fetch 10 MB of rustup to do it, and ours says where
-  # everything else goes. `rustup help` is an explicit request for the real
-  # thing, so it gets the real thing.
-  ""|-h|--help|help)
-    if [ -n "${1:-}" ] && [ "$(basename "$0")" = rustup ]
-    then passthrough "$@"
-    else cmd_help
-    fi ;;
+  # `help` asks for the full command list, and that list is rustup's, so it is
+  # fetched and asked -- under either name. A bare invocation is not a request
+  # for rustup: it gets this summary, which says where everything else goes.
+  "") cmd_help ;;
+  -h|--help|help) passthrough "$@" ;;
 
   *) passthrough "$@" ;;
 esac

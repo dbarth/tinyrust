@@ -50,13 +50,11 @@ Note: an existing rustup is never touched — its shims are left alone and you u
 | | |
 |---|---|
 | `trustup install [DIR]` | fetch the toolchain, no rustup |
-| `trustup list` | what is installed, and what else is on offer |
-| `trustup size` | where the bytes are |
-| `trustup version` | this, and the toolchain it manages |
-| `trustup go full` | the full official toolchain, docs and all |
-| `trustup go tiny` | back to tinyrust, no rustup in the path |
+| `trustup info` | version, toolchain, components, targets, size |
+| `trustup go full \| tiny` | switch between the full toolchain and the tiny one |
 | `trustup trim` | remove what `go full` installed |
-| `component add\|list`, `target add\|list`, `update` | intercepted: rustup refuses these on a linked toolchain |
+| `trustup update` | tinyrust is replaced whole, not updated |
+| `component add\|list`, `target add\|list` | intercepted: rustup refuses these on a linked toolchain |
 | anything else | passed to rustup, fetched on first use |
 
 `component add` resolves three ways and never mixes silently:
@@ -125,7 +123,7 @@ And the rest:
 
 ## Not done
 
-- No `update`: reinstall is `rm -rf ~/.rustup/toolchains/tinyrust && trustup install`.
+- No in-place `update`: `trustup install` replaces the toolchain whole.
 - macOS aarch64 only.
 
 
