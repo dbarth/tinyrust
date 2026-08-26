@@ -52,6 +52,18 @@ esac
 DIST="${TRUSTUP_DIST:-https://github.com/dbarth/tinyrust/$RELEASE_PATH}"
 case "$DIST" in */|*://*) ;; *) DIST="file://$DIST" ;; esac
 
+# macOS ships bash 3.2, which has no $'\uXXXX'; these are the UTF-8 bytes.
+TICK=$(printf '\342\234\223')
+DOWNLOADED_B=0
+# What `rustup` costs by default -- the profile a user gets by following the
+# rust-lang.org instructions. The download is the sum of that profile's six
+# components for this target, taken from the official manifest; the installed
+# figure is rustup's own documented 1.4 GB. Both baselines are the same thing,
+# so the two savings below can be read together.
+OFFICIAL_DL=111
+OFFICIAL_SIZE=1400
+saved() { local d=$(( $1 - $2 )); if [ "$d" -gt 0 ]; then printf '(%s MB saved)' "$d"; fi; }
+total() { printf '\033[1m%s %s MB\033[0m %s\n' "$1" "$2" "$3"; }
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
 die()  { printf 'trustup: %s\n' "$*" >&2; exit 1; }
@@ -119,46 +131,39 @@ print(m.group(1))
 PY
 }
 
-# Tens of megabytes over a link of unknown speed: silence reads as a hang.
-# curl's own -# bar redraws from column 0, so it cannot carry a label; this
-# draws one instead, from a HEAD for the total and the partial file for the
-# progress. Falls back to a bare spinner if the server gives no length, and to
-# nothing at all when stdout is not a terminal, so logs stay readable.
-BAR='##############################'   # 30
-download() {
-  local label="$1" url="$2" out="$3" total now pct n pid rc=0
+# Tens of megabytes over a link of unknown speed: silence reads as a hang. A
+# spinner is enough -- these are a handful of files whose sizes are printed the
+# moment each lands, and a percentage that runs for four seconds is noise.
+SPIN='|/-\'
 
-  if [ ! -t 1 ]; then
-    curl -sSfL -o "$out" "$url"; return
+# Column 0 is the mark, then the item, then the size in a fixed column so every
+# line agrees -- manifest included. Called with no size for a failure, which
+# prints the mark and the name alone.
+mark() {
+  local m="$1" label="$2" sz="${3:-}" extra="${4:-}"
+  if [ -n "$sz" ]; then printf '\r%s %-22s %5s MB%s\n' "$m" "$label" "$sz" "${extra:+  $extra}"
+  else                  printf '\r%s %s\n' "$m" "$label"
   fi
-
-  total="$(curl -sSfLI "$url" 2>/dev/null \
-           | awk 'tolower($1)=="content-length:"{print $2+0}' | tail -1)"
-  : "${total:=0}"
-
-  curl -sSfL -o "$out" "$url" & pid=$!
-  n=0
-  while kill -0 "$pid" 2>/dev/null; do
-    now=$(stat -f%z "$out" 2>/dev/null || echo 0)
-    if [ "$total" -gt 0 ]; then
-      pct=$(( now * 100 / total )); [ "$pct" -gt 100 ] && pct=100
-      n=$(( pct * ${#BAR} / 100 ))
-    else
-      pct=0; n=$(( (n + 1) % ${#BAR} ))
-    fi
-    printf '\r  %-16s [%-*s] %3d%%' "$label" "${#BAR}" "${BAR:0:n}" "$pct"
-    sleep 0.2
-  done
-  wait "$pid" || rc=$?
-  return $rc
 }
 
-# Replaces the progress line with the result. The padding exists only to cover
-# whatever the bar left behind, so it is dropped when there was no bar.
-ok() {
-  if [ -t 1 ]; then printf '\r  [ok] %-16s %5s MB%-20s\n' "$1" "$2" ""
-  else              printf '  [ok] %-16s %5s MB\n' "$1" "$2"
+# rustc is 30 MB and the rest are not, so a spinner alone leaves you guessing
+# for a minute. The counter climbs in the same column the final size lands in,
+# so the line resolves in place instead of jumping.
+download() {                              # download <label> <url> <out>
+  local label="$1" url="$2" out="$3" pid rc=0 i=0 now
+  if [ ! -t 1 ]; then
+    curl -sSfL -o "$out" "$url" || { mark x "$label"; return 1; }
+    return 0
   fi
+  curl -sSfL -o "$out" "$url" & pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    now=$(( $(stat -f%z "$out" 2>/dev/null || echo 0) / 1048576 ))
+    printf '\r%s %-22s %5s MB' "${SPIN:$((i % 4)):1}" "$label" "$now"
+    i=$((i + 1)); sleep 0.2
+  done
+  wait "$pid" || rc=$?
+  [ "$rc" = 0 ] || mark x "$label"
+  return $rc
 }
 
 fetch_component() {
@@ -170,7 +175,14 @@ fetch_component() {
   tarball="$work/$(basename "$url")"
 
   download "$pkg" "$url" "$tarball" || die "could not download $url"
-  local dl; dl="$(mb "$tarball")"
+  # There are no per-package dates -- the manifest carries one date for the
+  # whole channel. A version there is, in the file name, and it is the thing
+  # worth seeing when a component comes from a different dist.
+  local ver; ver="$(basename "$url")"; ver="${ver%.tar.xz}"
+  ver="${ver#"$pkg"-}"; ver="${ver%-"$triple"}"
+  local dlb; dlb="$(stat -f%z "$tarball")"
+  DOWNLOADED_B=$(( DOWNLOADED_B + dlb ))
+  local dl=$(( dlb / 1048576 ))
 
   # Verified here rather than trusted: this is the one thing rustup does that
   # a plain download does not.
@@ -196,7 +208,7 @@ fetch_component() {
   grep -qxF "$pkg" "$dest/.trustup-components" 2>/dev/null \
     || printf '%s\n' "$pkg" >> "$dest/.trustup-components"
 
-  ok "$pkg" "$dl"
+  mark "$TICK" "$pkg" "$dl" "$ver${FROM:+  $FROM}"
 }
 
 cmd_install_direct() {
@@ -211,16 +223,17 @@ cmd_install_direct() {
   # rustup's own layout, so the two can coexist and `rustup default tinyrust`
   # works once a rustup exists.
   local dest="$ROOT/toolchains/tinyrust"
-  say "installing $CHANNEL for $triple into $dest"
+  say "downloading $CHANNEL for $triple"
   mkdir -p "$dest"
 
   local work; work="$(mktemp -d)"
   trap 'rm -rf "$work"' RETURN
 
   local mf="$work/channel.toml"
-  curl -sSfL -o "$mf" "$DIST/channel-rust-$CHANNEL.toml" \
+  download manifest "$DIST/channel-rust-$CHANNEL.toml" "$mf" \
     || die "could not fetch the $CHANNEL manifest"
-  note "manifest $(mb "$mf") MB, dated $(sed -n 's/^date = "\(.*\)"/\1/p' "$mf" | head -1)"
+  mark "$TICK" manifest "$(mb "$mf")" \
+    "$(sed -n 's/^date = "\(.*\)"/\1/p' "$mf" | head -1)"
 
   # Three components, and there is no fourth worth having: rustc carries the
   # compiler and its LLVM, rust-std the library for this target, cargo the
@@ -247,8 +260,18 @@ cmd_install_direct() {
   done
 
   printf '%s\n' "$CHANNEL" > "$dest/.trustup-channel"
+  local dl=$(( DOWNLOADED_B / 1048576 )) sz; sz="$(mb "$dest")"
+  printf '  %-22s %5s MB%s\n' downloaded "$dl" \
+    "$(s="$(saved "$OFFICIAL_DL" "$dl")"; [ -n "$s" ] && printf '  %s' "$s")"
+  note "installed into $dest"
   link_into_path "$dest"
-  say "installed: $(mb "$dest") MB"
+  total "installed:" "$sz" "$(saved "$OFFICIAL_SIZE" "$sz")"
+  env_hint
+  echo
+  say "Rust is installed. To start:"
+  echo
+  echo "    cargo new hello && cd hello && cargo run"
+  echo
 }
 
 # ---- rustup: the old way, kept for comparison ------------------------------
@@ -427,7 +450,6 @@ link_into_path() {
   fi
   note "linked into $CARGO_BIN"
 
-  case ":$PATH:" in *":$CARGO_BIN:"*) return ;; esac
   local line=". \"\$HOME/.cargo/env\""
   printf '#!/bin/sh\ncase ":$PATH:" in *":%s:"*) ;; *) PATH="%s:$PATH"; export PATH ;; esac\n' \
     "$CARGO_BIN" "$CARGO_BIN" > "$HOME/.cargo/env"
@@ -438,8 +460,10 @@ link_into_path() {
     printf '\n%s\n' "$line" >> "$rc"
     note "added $CARGO_BIN to $(basename "$rc")"
   done
-  note "open a new shell, or: . \"\$HOME/.cargo/env\""
 }
+
+# Printed by the callers, after their own total, so it is the last thing said.
+env_hint() { say "open a new shell, or: . \"\$HOME/.cargo/env\""; }
 
 cmd_component() {
   local verb="${1:-list}"; shift || true
@@ -497,9 +521,14 @@ INNER
   local omf="" pkg
   say "adding to $p"
   for pkg in "$@"; do
+    # rustup takes the short name and resolves it; the manifest publishes these
+    # as <name>-preview. Do the same, rather than making people know which of
+    # clippy, rustfmt and rust-analyzer carry the suffix and which do not.
+    if ! grep -qF "[pkg.$pkg.target." "$mf" && grep -qF "[pkg.$pkg-preview.target." "$mf"; then
+      pkg="$pkg-preview"
+    fi
     if grep -qF "[pkg.$pkg.target.$triple]" "$mf"; then
-      note "$pkg from $channel"
-      fetch_component "$pkg" "$triple" "$mf" "$p" "$work" no
+      FROM="$channel" fetch_component "$pkg" "$triple" "$mf" "$p" "$work" no
     elif [ "$DIST" != "https://static.rust-lang.org/dist" ] && \
          case "$ok" in *" $pkg "*) true ;; *) false ;; esac; then
       if [ -z "$omf" ]; then
@@ -512,10 +541,9 @@ INNER
       # Target-independent components are keyed by the literal, quoted "*".
       local key="$triple"
       grep -qF "[pkg.$pkg.target.$triple]" "$omf" || key='"*"'
-      note "$pkg from the official dist (compiler-independent)"
       local b="$work/before.$pkg" a="$work/after.$pkg"
       find "$p" -type f 2>/dev/null | sort > "$b"
-      DIST=https://static.rust-lang.org/dist \
+      DIST=https://static.rust-lang.org/dist FROM="official dist" \
         fetch_component "$pkg" "$key" "$omf" "$p" "$work" no
       find "$p" -type f 2>/dev/null | sort > "$a"
       upstream_is_independent "$pkg" "$b" "$a"
@@ -529,6 +557,7 @@ INNER
   # install-time linking happened before this component existed.
   link_into_path "$p"
   say "now: $(mb "$p") MB"
+  env_hint
 }
 
 # ---- looking at it ---------------------------------------------------------
