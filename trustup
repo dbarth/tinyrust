@@ -69,6 +69,10 @@ total() { printf '\033[1m%s %s MB\033[0m %s\n' "$1" "$2" "$3"; }
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
 die()  { printf 'trustup: %s\n' "$*" >&2; exit 1; }
+# Paths are shown, not parsed: $HOME is noise in every one of them.
+tilde() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;;
+                       "$HOME")   printf '~' ;;
+                       *)         printf '%s' "$1" ;; esac; }
 mb()   { du -sm "$@" 2>/dev/null | awk '{s+=$1} END {print s+0}'; }
 
 # The host triple, from the machine rather than from a guess. This is the whole
@@ -281,7 +285,7 @@ cmd_install_direct() {
   printf '  %-22s %5s MB  total\n' downloaded "$dl"
 
   total "tinyrust installed" "$sz" "$(saved "$OFFICIAL_SIZE" "$sz")"
-  note "placed into $dest"
+  note "placed into $(tilde "$dest")"
   link_into_path "$dest"
   warm_rustc_cargo
 
@@ -364,7 +368,7 @@ cmd_info() {
   fi
   row() { printf '  %-12s %s\n' "$1" "$2"; }
 
-  row toolchain "$("$q/bin/rustc" --version 2>/dev/null | awk '{print $2}') at $q"
+  row toolchain "$("$q/bin/rustc" --version 2>/dev/null | awk '{print $2}') at $(tilde "$q")"
 
   local d have_t=""
   for d in "$q"/lib/rustlib/*/lib; do
@@ -375,6 +379,12 @@ cmd_info() {
 
   local have_c; have_c="$(tr '\n' ' ' < "$q/.trustup-components" 2>/dev/null)"
   local show="${have_c:-rustc rust-std cargo}"; row installed "${show% }"
+
+  local tot; tot="$(mb "$ROOT")"
+  if [ "$tot" = "$(mb "$q")" ]
+  then row size "$tot MB"
+  else row size "$(mb "$q") MB toolchain, $tot MB under $(tilde "$ROOT")"
+  fi
 
   # What the dist offers that is not here yet. This needs the manifest, so it
   # is the one part that touches the network; a failure drops the line rather
@@ -400,11 +410,6 @@ cmd_info() {
     if [ -n "$free_t" ]; then row "" "${free_t# }"; fi
   fi
 
-  local tot; tot="$(mb "$ROOT")"
-  if [ "$tot" = "$(mb "$q")" ]
-  then row size "$tot MB"
-  else row size "$(mb "$q") MB toolchain, $tot MB under $ROOT"
-  fi
   check_shims
 }
 
@@ -472,7 +477,7 @@ hand_over() {
       *) note "left the existing $base in $CARGO_BIN alone" ;;
     esac
   done
-  note "pointed $CARGO_BIN at rustup's shims"
+  note "pointed $(tilde "$CARGO_BIN") at rustup's shims"
 }
 
 # Which toolchain drives ~/.cargo/bin. `go full` hands it to rustup, `go tiny`
@@ -504,7 +509,7 @@ go_tiny() {
     case "$base" in trustup) continue ;; esac
     ln -sf "$f" "$CARGO_BIN/$base"
   done
-  say "tinyrust drives $CARGO_BIN again"
+  say "tinyrust drives $(tilde "$CARGO_BIN") again"
   note "rustup and anything it installed are untouched"
   note "trustup go full        hands it back"
 }
@@ -671,7 +676,7 @@ link_into_path() {
   else
     ln -sf "$p/bin/trustup" "$CARGO_BIN/rustup"
   fi
-  note "linked into $CARGO_BIN"
+  note "linked into $(tilde "$CARGO_BIN")"
 
   local line=". \"\$HOME/.cargo/env\""
   write_cargo_env
@@ -730,7 +735,7 @@ INNER
   # of it was compiled by a different rustc -- E0514, not a subtle bug.
   local ok; ok=" $(sed -n 's/^upstream-ok = \[\(.*\)\]/\1/p' "$mf" | tr -d '",' ) "
   local omf="" pkg
-  say "adding to $p"
+  say "adding to $(tilde "$p")"
   for pkg in "$@"; do
     # rustup takes the short name and resolves it; the manifest publishes these
     # as <name>-preview. Do the same, rather than making people know which of
