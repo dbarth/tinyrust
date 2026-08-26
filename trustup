@@ -353,12 +353,68 @@ check_shims() {
 }
 
 
-# rustup reports "no updatable toolchains installed" for a linked toolchain,
-# which is true and useless. Named toolchains are its business, so those pass
-# through; a bare `update` is about tinyrust, and tinyrust is replaced whole.
-# One answer to "what have I got": which trustup, which compiler, what has been
-# added to it, what it can emit for, and what it costs. Replaces the separate
-# version, size and list verbs.
+# `info` is a list of lines, one function each, so the order at the bottom of
+# cmd_info is the only thing to edit to rearrange it. They read the facts
+# cmd_info gathers rather than recomputing them -- bash scopes `local`
+# dynamically, so a caller's locals are visible here. That is why these are not
+# callable on their own.
+row() { printf '  %-12s %s\n' "$1" "$2"; }
+
+info_toolchain() {
+  row toolchain "$("$q/bin/rustc" --version 2>/dev/null | awk '{print $2}') at $(tilde "$q")"
+}
+
+info_targets() { row targets "${have_t# }"; }
+
+info_installed() {
+  local show="${have_c:-rustc rust-std cargo}"
+  row installed "${show% }"
+}
+
+info_size() {
+  if [ "$tot" = "$(mb "$q")" ]
+  then row size "$tot MB"
+  else row size "$(mb "$q") MB toolchain, $tot MB under $(tilde "$ROOT")"
+  fi
+}
+
+# What the dist offers that is not here yet, components first and then any
+# target that could be added. Silent when the manifest could not be fetched.
+info_available() {
+  [ -s "$mf" ] || return 0
+  local pkg free_c="" free_t=""
+  for pkg in $(grep -o "^\[pkg\.[^.]*\.target\.$triple\]" "$mf" \
+               | sed "s/^\[pkg\.//; s/\.target\..*//"); do
+    case " $have_c " in *" $pkg "*) ;; *) free_c="$free_c $pkg" ;; esac
+  done
+  for pkg in $(grep -o '^\[pkg\.rust-std\.target\.[^]]*\]' "$mf" \
+               | sed 's/^\[pkg\.rust-std\.target\.//; s/\]$//'); do
+    case " $have_t " in *" $pkg "*) ;; *) free_t="$free_t $pkg" ;; esac
+  done
+  if [ -n "$free_c" ]; then row available "${free_c# }"; fi
+  if [ -n "$free_t" ]; then row "" "${free_t# }"; fi
+}
+
+# Anything under $ROOT that is not the toolchain: rustup itself, whatever it
+# installed, its download cache. Only worth naming when it is worth removing,
+# and `trim` is what removes it.
+info_extra() {
+  [ "$(( tot - $(mb "$q") ))" -ge 10 ] || return 0
+  local d n extra=""
+  for d in "$ROOT"/cargo "$ROOT"/rustup/toolchains/* \
+           "$ROOT"/rustup/downloads "$ROOT"/rustup/tmp; do
+    # -L skips the tinyrust symlink rustup keeps beside its own toolchains.
+    { [ -d "$d" ] && [ ! -L "$d" ]; } || continue
+    n="$(mb "$d")"
+    [ "$n" -ge 1 ] || continue
+    case "$d" in
+      "$ROOT"/cargo) extra="$extra, rustup $n MB" ;;
+      *)             extra="$extra, $(basename "$d") $n MB" ;;
+    esac
+  done
+  if [ -n "$extra" ]; then row extra "${extra#, }"; fi
+}
+
 cmd_info() {
   local q; q="$(prefix 2>/dev/null)" || q=""
   say "trustup $TRUSTUP_VERSION"
@@ -366,68 +422,31 @@ cmd_info() {
     note "no toolchain installed -- run '$(basename "$0") install'"
     return
   fi
-  row() { printf '  %-12s %s\n' "$1" "$2"; }
 
-  row toolchain "$("$q/bin/rustc" --version 2>/dev/null | awk '{print $2}') at $(tilde "$q")"
-
+  # Gathered once, read by the lines below.
+  local tot; tot="$(mb "$ROOT")"
+  local triple; triple="$(host_triple)"
+  local have_c; have_c="$(tr '\n' ' ' < "$q/.trustup-components" 2>/dev/null)"
   local d have_t=""
   for d in "$q"/lib/rustlib/*/lib; do
     [ -d "$d" ] || continue
     d="${d%/lib}"; have_t="$have_t $(basename "$d")"
   done
-  row targets "${have_t# }"
-
-  local have_c; have_c="$(tr '\n' ' ' < "$q/.trustup-components" 2>/dev/null)"
-  local show="${have_c:-rustc rust-std cargo}"; row installed "${show% }"
-
-  local tot; tot="$(mb "$ROOT")"
-  if [ "$tot" = "$(mb "$q")" ]
-  then row size "$tot MB"
-  else row size "$(mb "$q") MB toolchain, $tot MB under $(tilde "$ROOT")"
-  fi
-
-  # What the dist offers that is not here yet. This needs the manifest, so it
-  # is the one part that touches the network; a failure drops the line rather
-  # than the command.
+  # The one part that touches the network. A failure leaves $mf empty and
+  # info_available says nothing, rather than the command failing.
   local work; work="$(mktemp -d)"
   trap 'rm -rf "$work"' RETURN
   local channel; channel="$(cat "$q/.trustup-channel" 2>/dev/null || echo "$CHANNEL")"
   local mf="$work/channel.toml"
-  if curl -sSfL -o "$mf" "$DIST/channel-rust-$channel.toml" 2>/dev/null; then
-    local triple; triple="$(host_triple)"
-    local pkg free_c="" free_t=""
-    for pkg in $(grep -o "^\[pkg\.[^.]*\.target\.$triple\]" "$mf" \
-                 | sed "s/^\[pkg\.//; s/\.target\..*//"); do
-      case " $have_c " in *" $pkg "*) ;; *) free_c="$free_c $pkg" ;; esac
-    done
-    for pkg in $(grep -o '^\[pkg\.rust-std\.target\.[^]]*\]' "$mf" \
-                 | sed 's/^\[pkg\.rust-std\.target\.//; s/\]$//'); do
-      case " $have_t " in *" $pkg "*) ;; *) free_t="$free_t $pkg" ;; esac
-    done
-    # `if`, not `&&`: a trailing && list that fails is the shape that has
-    # silently aborted functions here before.
-    if [ -n "$free_c" ]; then row available "${free_c# }"; fi
-    if [ -n "$free_t" ]; then row "" "${free_t# }"; fi
-  fi
+  curl -sSfL -o "$mf" "$DIST/channel-rust-$channel.toml" 2>/dev/null || : > "$mf"
 
-  # Anything under $ROOT that is not the toolchain: rustup itself, whatever it
-  # installed, its download cache. Only worth naming when it is worth removing,
-  # and `trim` is what removes it.
-  if [ "$(( tot - $(mb "$q") ))" -ge 10 ]; then
-    local d n extra=""
-    for d in "$ROOT"/cargo "$ROOT"/rustup/toolchains/* \
-             "$ROOT"/rustup/downloads "$ROOT"/rustup/tmp; do
-      # -L skips the tinyrust symlink rustup keeps beside its own toolchains.
-      { [ -d "$d" ] && [ ! -L "$d" ]; } || continue
-      n="$(mb "$d")"
-      [ "$n" -ge 1 ] || continue
-      case "$d" in
-        "$ROOT"/cargo) extra="$extra, rustup $n MB" ;;
-        *)             extra="$extra, $(basename "$d") $n MB" ;;
-      esac
-    done
-    if [ -n "$extra" ]; then row extra "${extra#, }"; fi
-  fi
+  # The order of `info`. Rearrange freely.
+  info_toolchain
+  info_targets
+  info_installed
+  info_size
+  info_available
+  info_extra
   check_shims
 }
 
