@@ -40,9 +40,16 @@ CHANNEL="${TRUSTUP_CHANNEL:-tinyrust}"
 # instead of the official one. Same manifest format, same fetch path.
 # The tiny packages, unless told otherwise. Falls back to the official dist if
 # no release is reachable -- see resolve_dist.
+# A tag name, or `latest`. GitHub spells the two cases differently:
+# releases/download/<tag>/<asset> for a tag, releases/latest/download/<asset>
+# for whatever is current. Getting this backwards 404s.
 TINYRUST_RELEASE="${TINYRUST_RELEASE:-latest}"
 OFFICIAL="https://static.rust-lang.org/dist"
-DIST="${TRUSTUP_DIST:-https://github.com/dbarth/tinyrust/releases/download/$TINYRUST_RELEASE}"
+case "$TINYRUST_RELEASE" in
+  latest) RELEASE_PATH="releases/latest/download" ;;
+  *)      RELEASE_PATH="releases/download/$TINYRUST_RELEASE" ;;
+esac
+DIST="${TRUSTUP_DIST:-https://github.com/dbarth/tinyrust/$RELEASE_PATH}"
 case "$DIST" in */|*://*) ;; *) DIST="file://$DIST" ;; esac
 
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
