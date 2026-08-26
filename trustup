@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #
-# trustup -- tiny-rustup. Installs the smallest Rust toolchain that builds for
-# THIS machine, and passes everything else to rustup.
+# trustup -- a thin rustup wrapper, installing the tinyrust toolchain
 #
 #   trustup install [DIR]     fetch components directly (default ~/.rustup)
 #   trustup install --rustup  drive rustup, then delete what it over-installed
@@ -55,11 +54,7 @@ case "$DIST" in */|*://*) ;; *) DIST="file://$DIST" ;; esac
 # macOS ships bash 3.2, which has no $'\uXXXX'; these are the UTF-8 bytes.
 TICK=$(printf '\342\234\223')
 DOWNLOADED_B=0
-# What `rustup` costs by default -- the profile a user gets by following the
-# rust-lang.org instructions. The download is the sum of that profile's six
-# components for this target, taken from the official manifest; the installed
-# figure is rustup's own documented 1.4 GB. Both baselines are the same thing,
-# so the two savings below can be read together.
+# what `rustup` costs by default
 OFFICIAL_DL=111
 OFFICIAL_SIZE=1400
 saved() { local d=$(( $1 - $2 )); if [ "$d" -gt 0 ]; then printf '(%s MB saved)' "$d"; fi; }
@@ -144,6 +139,17 @@ mark() {
   if [ -n "$sz" ]; then printf '\r%s %-22s %5s MB%s\n' "$m" "$label" "$sz" "${extra:+  $extra}"
   else                  printf '\r%s %s\n' "$m" "$label"
   fi
+}
+
+# macOS validates a freshly written Mach-O the first time it is executed --
+# rustc plus the 110 MB librustc_driver it loads -- and caches the verdict.
+# That is ~3 s, and it gets paid once whatever happens. Pay it here, where a
+# wait is expected and a line says what is going on, rather than on the first
+# bare `trustup` or the first `cargo build`, where it reads as a hang.
+warm_rustc_cargo() {
+  note "checking binaries"
+  "$dest/bin/rustc" --version >/dev/null 2>&1 || true
+  "$dest/bin/cargo" --version >/dev/null 2>&1 || true
 }
 
 # rustc is 30 MB and the rest are not, so a spinner alone leaves you guessing
@@ -261,16 +267,20 @@ cmd_install_direct() {
 
   printf '%s\n' "$CHANNEL" > "$dest/.trustup-channel"
   local dl=$(( DOWNLOADED_B / 1048576 )) sz; sz="$(mb "$dest")"
-  printf '  %-22s %5s MB%s\n' downloaded "$dl" \
-    "$(s="$(saved "$OFFICIAL_DL" "$dl")"; [ -n "$s" ] && printf '  %s' "$s")"
-  note "installed into $dest"
+  printf '  %-22s %5s MB  total\n' downloaded "$dl"
+
+  total "tinyrust installed" "$sz" "$(saved "$OFFICIAL_SIZE" "$sz")"
+  note "placed into $dest"
   link_into_path "$dest"
-  total "installed:" "$sz" "$(saved "$OFFICIAL_SIZE" "$sz")"
-  env_hint
-  echo
-  say "Rust is installed. To start:"
-  echo
-  echo "    cargo new hello && cd hello && cargo run"
+  warm_rustc_cargo
+
+  say "start with:"
+  # whether this shell needs the env sourced
+  case ":$PATH:" in
+    *":$CARGO_BIN:"*) ;;
+    *) note ". \"\$HOME/.cargo/env\"" ;;
+  esac
+  note "cargo new hello && cd hello && cargo run"
   echo
 }
 
@@ -356,21 +366,27 @@ cmd_identity() {
   # `|| true` has to sit outside the substitution: prefix dies with exit, which
   # ends the subshell before any `|| true` inside it could run.
   local p; p="$(prefix 2>/dev/null)" || p=""
-  say "trustup -- a thin rustup wrapper, installing a tinyrust toolchain"
+  # the program identity
+  sed -n '3,3p' "$0" | sed 's/^# \{0,1\}//'
   if [ -n "$p" ] && [ -x "$p/bin/rustc" ]; then
     note "toolchain  $("$p/bin/rustc" --version 2>/dev/null) at $p"
     note "size       $(mb "$p") MB"
   else
     note "toolchain  none installed"
   fi
+  echo
   note "this is not rustup. Commands it does not handle are passed through to"
   note "the real one, fetched on demand. For the full official toolchain:"
   note "  trustup install --rustup"
 }
 
+cmd_help() {
+ sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'
+}
+
 passthrough() {
   local verb="$1"; shift
-  ensure_rustup
+  ensure_rustup "$verb"
   export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
   exec "$ROOT/cargo/bin/rustup" "$verb" "$@"
 }
@@ -379,16 +395,21 @@ passthrough() {
 # installed with no toolchain of its own -- the one already here is linked in
 # as "tinyrust" and made default, so `rustup show`, `which`, `target add` and
 # the rest operate on this toolchain rather than downloading a second one.
-ensure_rustup() {
+ensure_rustup() {                         # ensure_rustup <verb, for the message>
   export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
   if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
-    say "fetching rustup (first use of a passed-through command)"
+    say "first-time use, fetching rustup, for '$1'"
     mkdir -p "$ROOT"
     local init="$ROOT/rustup-init.sh"
+    # Plain curl: this is a 20 KB shell script, and `download` leaves its
+    # spinner line open for a caller-printed mark that does not belong here.
     [ -f "$init" ] || curl -sSfL "https://sh.rustup.rs" -o "$init" \
       || die "could not download rustup-init"
+    # rustup-init's own progress is left visible. Silencing it made every
+    # passed-through command look like a hang: one line, then nothing for as
+    # long as the download took.
     sh "$init" -y --no-modify-path --profile minimal \
-       --default-toolchain none >/dev/null 2>&1 \
+       --default-toolchain none 2>&1 | sed 's/^/  /' \
       || die "rustup-init failed"
   fi
   local p; p="$(prefix)"
@@ -461,9 +482,6 @@ link_into_path() {
     note "added $CARGO_BIN to $(basename "$rc")"
   done
 }
-
-# Printed by the callers, after their own total, so it is the last thing said.
-env_hint() { say "open a new shell, or: . \"\$HOME/.cargo/env\""; }
 
 cmd_component() {
   local verb="${1:-list}"; shift || true
@@ -557,7 +575,6 @@ INNER
   # install-time linking happened before this component existed.
   link_into_path "$p"
   say "now: $(mb "$p") MB"
-  env_hint
 }
 
 # ---- looking at it ---------------------------------------------------------
@@ -612,7 +629,7 @@ case "${1:-}" in
   trim) cmd_trim ;;
   size) cmd_size ;;
   env)  cmd_env ;;
-  ""|-h|--help|help) cmd_identity; sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' ;;
+  ""|-h|--help|help) cmd_help ;;
   -V|--version|version) cmd_identity ;;
   *) passthrough "$@" ;;
 esac

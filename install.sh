@@ -24,7 +24,7 @@ if [ -n "${TINYRUST_SOURCE:-}" ]; then
   # path used to test the installer before it is published.
   [ -x "$TINYRUST_SOURCE/trustup" ] || { echo "no trustup in $TINYRUST_SOURCE" >&2; exit 1; }
   TRUSTUP="$TINYRUST_SOURCE/trustup"
-  say "tinyrust from $TINYRUST_SOURCE"
+  say "fetching trustup from $TINYRUST_SOURCE"
 else
   # a staging copy: trustup installs itself into the toolchain, and the
   # ~/.cargo/bin links point there, so nothing permanent lives here.
