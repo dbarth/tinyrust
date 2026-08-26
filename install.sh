@@ -2,6 +2,11 @@
 #
 # tinyrust installer.
 #
+#   curl -sSfL https://dbarth.github.io/tinyrust/install.sh | sh
+#
+# Served by GitHub Pages from this repo's root, so it is this very file. The
+# raw.githubusercontent URL is the same thing without the Pages build:
+#
 #   curl -sSfL https://raw.githubusercontent.com/dbarth/tinyrust/master/install.sh | sh
 #
 # Fetches trustup and installs the tinyrust toolchain.

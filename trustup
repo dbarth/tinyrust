@@ -444,8 +444,8 @@ cmd_info() {
   info_toolchain
   info_targets
   info_installed
-  info_size
   info_available
+  info_size
   info_extra
   check_shims
 }

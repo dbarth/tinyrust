@@ -5,7 +5,7 @@ Tinyrust is the smallest Rust install for macOS. Get started faster and leaner.
 
 ## Get it
 
-    curl -sSfL https://raw.githubusercontent.com/dbarth/tinyrust/master/install.sh | sh
+    curl -sSfL https://dbarth.github.io/tinyrust/install.sh | sh
 
 ## Why tinyrust?
 
@@ -30,7 +30,7 @@ Both stay installed until you trim, and `go` decides which one runs.
 
 ## Use it
 
-    curl -sSfL https://raw.githubusercontent.com/dbarth/tinyrust/master/install.sh | sh
+    curl -sSfL https://dbarth.github.io/tinyrust/install.sh | sh
     cargo new hello && cd hello && cargo run --release
 
 The installer fetches the optimized toolchain and sets up the environment for building.
