@@ -599,6 +599,9 @@ cmd_measure() {
   local out="$SRC/build/$TRIPLE/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
   local stock="$HERE/toolchain/rust-stable"
+  # CI builds with no stock toolchain to compare against. Print -- rather than
+  # zeroes, and skip every percentage that would divide by one.
+  local have_stock=0; [ -d "$stock/lib" ] && have_stock=1
 
   b() { local t=0 f; for f in "$@"; do [ -f "$f" ] && t=$((t+$(stat -f%z "$f"))); done
         awk -v t=$t 'BEGIN{printf "%.1f", t/1048576}'; }
@@ -607,22 +610,26 @@ cmd_measure() {
   minus() { local root=$1; shift; local t; t=$(k "$root"); local p
             for p in "$@"; do [ -e "$p" ] && t=$((t - $(k "$p"))); done
             awk -v t=$t 'BEGIN{printf "%.1f", t/1024}'; }
-  pct() { awk -v a=$1 -v b=$2 'BEGIN{printf "%+.0f%%", (b-a)*100/a}'; }
+  pct() { [ "$have_stock" = 1 ] || { printf -- '--'; return; }
+          awk -v a=$1 -v b=$2 'BEGIN{ if (a+0 == 0) printf "--"; else printf "%+.0f%%", (b-a)*100/a }'; }
+  # stock-side size: -- when there is nothing to measure.
+  sb() { [ "$have_stock" = 1 ] && b "$@" || printf -- '--'; }
+  sminus() { [ "$have_stock" = 1 ] && minus "$@" || printf -- '--'; }
 
   say "stage$STAGE"; echo
 
   local o_drv s_drv s_llvm
   o_drv=$(b "$out"/lib/librustc_driver-*.dylib)
-  s_drv=$(b "$stock"/lib/librustc_driver-*.dylib)
-  s_llvm=$(b "$stock"/lib/libLLVM.dylib)   # the rustlib copy is a symlink to this
+  s_drv=$(sb "$stock"/lib/librustc_driver-*.dylib)
+  s_llvm=$(sb "$stock"/lib/libLLVM.dylib)  # the rustlib copy is a symlink to this
 
   say "the compiler, and the LLVM inside it"
   printf '  %-30s %8s %11s\n' "" stock "this build"
   printf '  %-30s %8s %11s\n' "librustc_driver" "$s_drv" "$o_drv"
   printf '  %-30s %8s %11s\n' "libLLVM.dylib" "$s_llvm" "-- static"
-  printf '  %-30s %8s %11s   %s\n' "" \
-    "$(awk -v a=$s_drv -v b=$s_llvm 'BEGIN{printf "%.1f", a+b}')" "$o_drv" \
-    "$(pct "$(awk -v a=$s_drv -v b=$s_llvm 'BEGIN{print a+b}')" "$o_drv")"
+  local s_sum; s_sum=$([ "$have_stock" = 1 ] \
+    && awk -v a=$s_drv -v b=$s_llvm 'BEGIN{printf "%.1f", a+b}' || printf -- '--')
+  printf '  %-30s %8s %11s   %s\n' "" "$s_sum" "$o_drv" "$(pct "$s_sum" "$o_drv")"
   echo
 
   say "std, per target"
@@ -649,7 +656,7 @@ cmd_measure() {
   note "out of this build: rustdoc$([ -e "$out/bin/rustdoc" ] || echo ' (not built)')"
   echo
   local s_tot o_one o_all
-  s_tot=$(minus "$stock" $s_ex)
+  s_tot=$(sminus "$stock" $s_ex)
   o_all=$(minus "$out" $o_ex)
   # Same capability as stock, i.e. counting only the host target's std.
   o_one=$(minus "$out" $o_ex $(for t in $TARGETS; do
