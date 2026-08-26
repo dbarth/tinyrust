@@ -19,19 +19,13 @@ dependencies as usual:
     rustup component add rust-analyzer-preview
     cargo add serde
 
-If you want the full standard install, add it beside this one:
+If you want the full standard install, docs and all:
 
-    trustup toolchain add
+    trustup go full      # 1359 MB, measured, on top of this
+    trustup go tiny      # back to tinyrust
+    trustup trim         # remove the full one again
 
-That fetches the official toolchain through rustup and makes it the default.
-Both stay installed, and rustup switches between them:
-
-    rustup default tinyrust
-    rustup default stable
-
-To drop rustup out of the path entirely and have tinyrust run directly again:
-
-    trustup standalone
+Both stay installed until you trim, and `go` decides which one runs.
 
 
 ## Use it
@@ -59,8 +53,9 @@ Note: an existing rustup is never touched — its shims are left alone and you u
 | `trustup list` | what is installed, and what else is on offer |
 | `trustup size` | where the bytes are |
 | `trustup version` | this, and the toolchain it manages |
-| `trustup toolchain add` | the full official toolchain, beside this one |
-| `trustup standalone` | stop going through rustup, tinyrust drives again |
+| `trustup go full` | the full official toolchain, docs and all |
+| `trustup go tiny` | back to tinyrust, no rustup in the path |
+| `trustup trim` | remove what `go full` installed |
 | `component add\|list`, `target add\|list`, `update` | intercepted: rustup refuses these on a linked toolchain |
 | anything else | passed to rustup, fetched on first use |
 

@@ -6,8 +6,9 @@
 #   trustup list              what is installed, and what else is on offer
 #   trustup size              where the bytes are
 #   trustup version           this, and the toolchain it manages
-#   trustup toolchain add     the full official toolchain, beside this one
-#   trustup standalone        stop going through rustup, tinyrust drives
+#   trustup go full           the full official toolchain, docs and all
+#   trustup go tiny           back to tinyrust, no rustup in the path
+#   trustup trim              remove what `go full` installed
 #
 # Handles only what rustup cannot do for a linked toolchain. Specifically:
 #
@@ -424,12 +425,23 @@ hand_over() {
   note "pointed $CARGO_BIN at rustup's shims"
 }
 
+# Which toolchain drives ~/.cargo/bin. `go full` hands it to rustup, `go tiny`
+# takes it back. Nothing here installs or removes anything by itself except
+# the toolchain `full` needs; `trim` is what removes.
+cmd_go() {
+  case "${1:-}" in
+    tiny) go_tiny ;;
+    full) shift; go_full "$@" ;;
+    *)    die "go takes 'tiny' or 'full'" ;;
+  esac
+}
+
 # The inverse of hand_over. After `toolchain add`, ~/.cargo/bin points at
 # rustup's shims for good: a reinstall will not take them back, because
 # claimed() cannot tell a shim we made from a foreign rustup's. This says
 # plainly that tinyrust drives again. rustup and the full toolchain stay
 # installed -- `trustup toolchain add` hands the wheel back.
-cmd_standalone() {
+go_tiny() {
   local q f base; q="$(prefix)"
   # Agree with rustup rather than contradict it: with direct links, `rustup
   # default` stops deciding anything, so leave it pointing where we point.
@@ -444,21 +456,19 @@ cmd_standalone() {
   done
   say "tinyrust drives $CARGO_BIN again"
   note "rustup and anything it installed are untouched"
-  note "trustup toolchain add    hands it back"
+  note "trustup go full        hands it back"
 }
 
-# `install` gives you tinyrust. This adds the official toolchain beside it and
-# hands rustup the wheel. tinyrust stays linked, so switching back is free.
-cmd_toolchain() {
-  local verb="${1:-list}"; shift || true
-  [ "$verb" = add ] || passthrough toolchain "$verb" "$@"
+# The full official toolchain, docs and all. rustup's default profile is what
+# the 1.4 GB in the README measures -- rustc, cargo, std, rust-docs, rustfmt,
+# clippy -- so this is the thing tinyrust is small against, one command away.
+go_full() {
   local name="${1:-stable}"
-
-  ensure_rustup toolchain
+  ensure_rustup go
   export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
   local before; before="$(mb "$ROOT")"
-  say "adding $name -- the full official toolchain, via rustup"
-  "$CARGO_HOME/bin/rustup" toolchain install "$name" \
+  say "installing $name, full profile -- rustc, cargo, std, docs, rustfmt, clippy"
+  "$CARGO_HOME/bin/rustup" toolchain install "$name" --profile default \
     || die "rustup could not install $name"
   "$CARGO_HOME/bin/rustup" default "$name" >/dev/null \
     || die "rustup could not make $name the default"
@@ -466,11 +476,38 @@ cmd_toolchain() {
   hand_over
   # At install time there was no rustup, so the env file has no RUSTUP_HOME.
   write_cargo_env
-  total "$name added:" "$(( $(mb "$ROOT") - before ))" "(now $(mb "$ROOT") MB total)"
-  say "rustup decides from here:"
-  note "rustup default tinyrust    back to the small one"
-  note "rustup default $name    the full one"
+  total "$name:" "$(( $(mb "$ROOT") - before ))" "(now $(mb "$ROOT") MB total)"
+  note "trustup go tiny     back to the small one"
+  note "trustup trim        remove it again"
   note "open a new shell, or: . \"\$HOME/.cargo/env\""
+}
+
+# Undo `go full`. Only what rustup installed goes -- tinyrust and rustup itself
+# stay, so `go full` can put it back without refetching rustup.
+cmd_trim() {
+  [ -x "$ROOT/cargo/bin/rustup" ] || die "nothing to trim -- no rustup installed here"
+  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
+  local list tc
+  list="$("$CARGO_HOME/bin/rustup" toolchain list 2>/dev/null | awk '$1 != "tinyrust" {print $1}')"
+  [ -n "$list" ] || die "nothing to trim -- tinyrust is the only toolchain"
+
+  say "removing:"
+  for tc in $list; do note "$tc"; done
+  local ans=""
+  if [ -t 0 ]; then
+    printf '  proceed? [y/N] '
+    read -r ans || ans=""
+  fi
+  case "$ans" in y|Y|yes|YES) ;; *) die "nothing removed" ;; esac
+
+  local before; before="$(mb "$ROOT")"
+  # Never delete what is currently running.
+  go_tiny >/dev/null
+  for tc in $list; do
+    "$CARGO_HOME/bin/rustup" toolchain uninstall "$tc" >/dev/null 2>&1 || true
+  done
+  total "freed:" "$(( before - $(mb "$ROOT") ))" "(now $(mb "$ROOT") MB total)"
+  note "tinyrust drives again"
 }
 
 cmd_help() {
@@ -720,14 +757,14 @@ case "${1:-}" in
   install)   shift; [ $# -eq 0 ] || ROOT="$1"; cmd_install_direct ;;
   list)      cmd_component list ;;
   size)      cmd_size ;;
-  standalone) cmd_standalone ;;
+  go)        shift; cmd_go "$@" ;;
+  trim)      cmd_trim ;;
   version)   cmd_version ;;
 
   # rustup refuses these on a linked toolchain, or answers with nothing
   component) shift; cmd_component "$@" ;;
   target)    shift; cmd_target "$@" ;;
   update)    shift; cmd_update "$@" ;;
-  toolchain) shift; cmd_toolchain "$@" ;;
 
   # Not passed through: printing rustup's help would fetch 10 MB of rustup to
   # do it, and this says plainly that everything else goes there anyway.
