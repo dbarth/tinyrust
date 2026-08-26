@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# trustup -- a thin rustup wrapper, installing the tinyrust toolchain
+# trustup -- a thin rustup wrapper for the tinyrust toolchain
 #
 #   trustup install [DIR]     fetch the toolchain directly (default ~/.rustup)
 #   trustup list              what is installed, and what else is on offer
@@ -255,11 +255,15 @@ cmd_install_direct() {
   local pkg
   for pkg in rustc rust-std cargo; do
     # Official tarballs carry things a build never opens, so they are pruned
-    # during extraction. A locally built one has already had everything
-    # unwanted left out -- pruning it again would delete rustdoc, which this
-    # toolchain deliberately ships for doctests.
-    fetch_component "$pkg" "$triple" "$mf" "$dest" "$work" \
-      "$([ -n "${TRUSTUP_DIST:-}" ] && echo no || echo yes)"
+    # during extraction. A tinyrust dist -- the published release as much as a
+    # local one -- has already had everything unwanted left out; pruning it
+    # again deletes rustdoc, which this toolchain ships on purpose for
+    # doctests. The test is which dist this is, not whether TRUSTUP_DIST
+    # happens to be set: that variable is for local testing, and gating on it
+    # meant every `curl | sh` install lost rustdoc.
+    local prune=no
+    case "$DIST" in "$OFFICIAL"*) prune=yes ;; esac
+    fetch_component "$pkg" "$triple" "$mf" "$dest" "$work" "$prune"
   done
 
   # rust-objcopy lives in lib/rustlib/<triple>/bin and has an rpath of
@@ -511,7 +515,7 @@ cmd_trim() {
 }
 
 cmd_help() {
-  sed -n '3,19p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Interception is right only while tinyrust is the toolchain rustup would run.
