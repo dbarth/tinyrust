@@ -544,10 +544,14 @@ cmd_trim() {
   export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
   local list tc
   list="$("$CARGO_HOME/bin/rustup" toolchain list 2>/dev/null | awk '$1 != "tinyrust" {print $1}')"
-  [ -n "$list" ] || die "nothing to trim -- tinyrust is the only toolchain"
 
   say "removing:"
+  # An empty list is not nothing to do: rustup itself is still 11 MB.
   for tc in $list; do note "$tc"; done
+  # rustup itself was never part of `go full` -- it arrives on first passthrough
+  # -- but leaving 11 MB behind is not "stay tiny", and it is refetched on
+  # demand. $ROOT/cargo is the home ensure_rustup made, not the user's ~/.cargo.
+  note "rustup ($(mb "$ROOT/cargo") MB) -- refetched when a passed-through command needs it"
   local ans=""
   if [ -t 0 ]; then
     printf '  proceed? [y/N] '
@@ -561,6 +565,9 @@ cmd_trim() {
   for tc in $list; do
     "$CARGO_HOME/bin/rustup" toolchain uninstall "$tc" >/dev/null 2>&1 || true
   done
+  rm -rf "$ROOT/rustup" "$ROOT/cargo"
+  # No rustup means no RUSTUP_HOME line to export.
+  write_cargo_env
   total "freed:" "$(( before - $(mb "$ROOT") ))" "(now $(mb "$ROOT") MB total)"
   note "tinyrust drives again"
 }
