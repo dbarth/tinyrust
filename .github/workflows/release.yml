@@ -1,16 +1,24 @@
 # Build a tinyrust toolchain on macOS and attach it to a release.
 #
+# Runs on a self-hosted runner by default. macOS minutes bill at 10x on a
+# private repo: a free month is 200 macOS minutes and one run of this is more
+# than that. Set the runner input to `hosted` only on a public repo.
+#
+# Nothing outside the runner workspace is written or deleted: build-rustc
+# confines itself to its own directory and mktemp -d, and `prepare` only
+# reports what is missing. Safe to point at a machine you care about.
+#
 # The awkward parts, all of them macOS-specific:
 #
-#   disk    the build leaves ~15 GB of intermediates for 233 MB of output, and
-#           a GitHub macOS runner has roughly 14 GB free. Xcode is deleted
-#           first, which buys back more than the build needs. The LLVM comes
-#           in pre-pruned from the llvm workflow, so this runner never sees
-#           the 2.7 GB unpack.
+#   disk    the build leaves ~15 GB of intermediates for 233 MB of output, so
+#           `prepare` refuses to start under 25 GB. The LLVM comes in
+#           pre-pruned from the llvm workflow, so no runner sees the 2.7 GB
+#           unpack. macos-14-arm64/20260629 reported 72 GB free.
 #   arch    macos-14/15 runners are arm64; an x86_64 *host* toolchain needs
 #           macos-13. std for both targets is cross-built from either.
-#   cost    macOS minutes bill at 10x on private repos. A run is ~35 minutes,
-#           so ~350 billable minutes. Public repos are free.
+#   clean   checkout wipes untracked files, so a self-hosted run refetches
+#           rust/ each time. That is the price of not building on stale state;
+#           llvm/ comes back from the cache.
 #   zstd    wasmer's LLVM binaries link Homebrew's libzstd, and macOS ships
 #           none, so the runner needs it before anything links.
 #   signing binaries are ad-hoc signed by `build-rustc bundle`. That is enough
@@ -28,33 +36,51 @@ on:
       tag:
         description: "release tag to publish to"
         required: true
+      runner:
+        description: "self-hosted | hosted"
+        default: "self-hosted"
   push:
     tags: ["v*"]
 
+# Default repo token is read-only; creating a release needs this.
+permissions:
+  contents: write
+
 jobs:
   macos:
-    runs-on: macos-14          # arm64. macos-13 for an x86_64 host build.
-    timeout-minutes: 120
+    runs-on: ${{ inputs.runner == 'hosted' && 'macos-14' || 'self-hosted' }}
+    timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      # ~15 GB of intermediates against ~14 GB free. Xcode is the only thing
-      # big enough to matter, and the build needs only the command line tools.
-      - name: make room
+      # Nothing here deletes anything. The build needs disk and libzstd; check
+      # for both and stop with a message naming the fix. A throwaway runner
+      # that is short of space is a runner-image problem, not something a
+      # workflow should paper over by deleting the developer tools.
+      - name: prepare
+        env:
+          NEED: "25"       # GB: ~15 GB of intermediates, with room
         run: |
-          df -h / | tail -1
-          sudo rm -rf /Applications/Xcode*.app
-          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches
-          df -h / | tail -1
+          avail=$(df -g . | tail -1 | awk '{print $4}')
+          echo "$avail GB free, need $NEED"
+          [ "$avail" -ge "$NEED" ] || { echo "not enough disk"; exit 1; }
 
-      - name: zstd
-        run: brew install zstd
+          # wasmer's LLVM binaries link Homebrew's libzstd and macOS ships none.
+          # Installing it is additive, so a throwaway runner may do it; a
+          # developer machine is told what to run instead.
+          if [ -e "$(brew --prefix zstd 2>/dev/null)/lib/libzstd.a" ]; then
+            echo "zstd present"
+          elif [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
+            brew install zstd
+          else
+            echo "libzstd.a missing -- brew install zstd"; exit 1
+          fi
 
       # The pruned artifact from the llvm workflow: 115 MB, unpacking to 768 MB.
       # Without it this step is a 457 MB download and a 2.7 GB unpack.
       - name: cache llvm
         id: llvm-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: llvm
           key: llvm-${{ env.LLVM_VERSION }}-darwin-aarch64-v1

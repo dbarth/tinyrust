@@ -4,6 +4,11 @@
 #
 #   wasmer tarball   457 MB  ->  2.7 GB unpacked
 #   what we keep     768 MB  ->  115 MB packed
+#
+# Runs on a self-hosted runner by default: macOS minutes bill at 10x on a
+# private repo, and one run of this is a third of a free month. Nothing here
+# writes or deletes outside the runner workspace, and `prepare` only reports
+# what is missing rather than making room for itself.
 name: llvm
 
 on:
@@ -12,23 +17,52 @@ on:
       release:
         description: "wasmer llvm-custom-builds release (e.g. 22.x)"
         default: "22.x"
+      runner:
+        description: "self-hosted | hosted"
+        default: "self-hosted"
+
+# Default repo token is read-only, which is what failed the first run at the
+# upload step after six minutes of work.
+permissions:
+  contents: write
 
 jobs:
   prune:
-    runs-on: macos-14
+    runs-on: ${{ inputs.runner == 'hosted' && 'macos-14' || 'self-hosted' }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - name: make room
+      - uses: actions/checkout@v7
+
+      # Nothing here deletes anything. The build needs disk and libzstd; check
+      # for both and stop with a message naming the fix. A throwaway runner
+      # that is short of space is a runner-image problem, not something a
+      # workflow should paper over by deleting the developer tools.
+      - name: prepare
+        env:
+          NEED: "12"       # GB: 2.7 GB unpack plus the 768 MB kept
         run: |
-          sudo rm -rf /Applications/Xcode*.app
-          df -h / | tail -1
-      - run: brew install zstd
+          avail=$(df -g . | tail -1 | awk '{print $4}')
+          echo "$avail GB free, need $NEED"
+          [ "$avail" -ge "$NEED" ] || { echo "not enough disk"; exit 1; }
+
+          # wasmer's LLVM binaries link Homebrew's libzstd and macOS ships none.
+          # Installing it is additive, so a throwaway runner may do it; a
+          # developer machine is told what to run instead.
+          if [ -e "$(brew --prefix zstd 2>/dev/null)/lib/libzstd.a" ]; then
+            echo "zstd present"
+          elif [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
+            brew install zstd
+          else
+            echo "libzstd.a missing -- brew install zstd"; exit 1
+          fi
+
       - name: fetch and prune
         env:
           LLVM_RELEASE: ${{ inputs.release }}
         run: ./build-rustc llvm
+
       - run: ./build-rustc llvm-pack
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: llvm-${{ inputs.release }}
