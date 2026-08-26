@@ -42,8 +42,9 @@ on:
       runner:
         description: "self-hosted | hosted"
         default: "self-hosted"
-  push:
-    tags: ["v*"]
+  # No push trigger. A tag push would create a run that a self-hosted runner
+  # picks up unattended -- and one created while the runner is offline sits
+  # queued for 24h, then starts at login. Releases are dispatched by hand.
 
 # Default repo token is read-only; creating a release needs this.
 permissions:
