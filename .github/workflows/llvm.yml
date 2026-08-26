@@ -5,10 +5,9 @@
 #   wasmer tarball   457 MB  ->  2.7 GB unpacked
 #   what we keep     768 MB  ->  115 MB packed
 #
-# Runs on a self-hosted runner by default: macOS minutes bill at 10x on a
-# private repo, and one run of this is a third of a free month. Nothing here
-# writes or deletes outside the runner workspace, and `prepare` only reports
-# what is missing rather than making room for itself.
+# Runs on GitHub's macOS runners: free on a public repo, 10x-billed on a
+# private one. Third-party actions are pinned to commit SHAs rather than tags,
+# so a repointed tag cannot change what executes here.
 name: llvm
 
 on:
@@ -17,9 +16,6 @@ on:
       release:
         description: "wasmer llvm-custom-builds release (e.g. 22.x)"
         default: "22.x"
-      runner:
-        description: "self-hosted | hosted"
-        default: "self-hosted"
 
 # Default repo token is read-only, which is what failed the first run at the
 # upload step after six minutes of work.
@@ -28,10 +24,10 @@ permissions:
 
 jobs:
   prune:
-    runs-on: ${{ inputs.runner == 'hosted' && 'macos-14' || 'self-hosted' }}
+    runs-on: macos-14
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Nothing here deletes anything. The build needs disk and libzstd; check
       # for both and stop with a message naming the fix. A throwaway runner
@@ -63,7 +59,7 @@ jobs:
 
       - run: ./build-rustc llvm-pack
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: llvm-${{ inputs.release }}
           files: dist-llvm/*

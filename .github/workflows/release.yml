@@ -1,19 +1,21 @@
 # Build a tinyrust toolchain on macOS and attach it to a release.
 #
-# Runs on a self-hosted runner by default. macOS minutes bill at 10x on a
-# private repo: a free month is 200 macOS minutes and one run of this is more
-# than that. Set the runner input to `hosted` only on a public repo.
+# Runs on GitHub's macOS runners: free on a public repo, 10x-billed on a
+# private one. Third-party actions are pinned to commit SHAs rather than tags,
+# so a repointed tag cannot change what executes here.
 #
 # Nothing outside the runner workspace is written or deleted: build-rustc
 # confines itself to its own directory and mktemp -d, and `prepare` only
-# reports what is missing. Safe to point at a machine you care about.
+# reports what is missing.
 #
 # The awkward parts, all of them macOS-specific:
 #
 #   disk    the build leaves ~15 GB of intermediates for 233 MB of output, so
 #           `prepare` refuses to start under 25 GB. The LLVM comes in
 #           pre-pruned from the llvm workflow, so no runner sees the 2.7 GB
-#           unpack. macos-14-arm64/20260629 reported 72 GB free.
+#           unpack. macos-14-arm64/20260629 reported 72 GB free *after* Xcode
+#           was deleted; nothing deletes it now, so if `prepare` ever fails
+#           here, Xcode is why and NEED is the knob.
 #   arch    macos-14/15 runners are arm64; an x86_64 *host* toolchain needs
 #           macos-13. std for both targets is cross-built from either.
 #   clean   checkout wipes untracked files, so a self-hosted run refetches
@@ -36,12 +38,8 @@ on:
       tag:
         description: "release tag to publish to"
         required: true
-      runner:
-        description: "self-hosted | hosted"
-        default: "self-hosted"
-  # No push trigger. A tag push would create a run that a self-hosted runner
-  # picks up unattended -- and one created while the runner is offline sits
-  # queued for 24h, then starts at login. Releases are dispatched by hand.
+  # No push trigger. Releases are dispatched by hand, so a stray tag cannot
+  # start a 36-minute build.
 
 # Default repo token is read-only; creating a release needs this.
 permissions:
@@ -49,10 +47,10 @@ permissions:
 
 jobs:
   macos:
-    runs-on: ${{ inputs.runner == 'hosted' && 'macos-14' || 'self-hosted' }}
+    runs-on: macos-14
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Nothing here deletes anything. The build needs disk and libzstd; check
       # for both and stop with a message naming the fix. A throwaway runner
@@ -81,7 +79,7 @@ jobs:
       # Without it this step is a 457 MB download and a 2.7 GB unpack.
       - name: cache llvm
         id: llvm-cache
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: llvm
           key: llvm-${{ env.LLVM_VERSION }}-darwin-aarch64-v1
@@ -132,7 +130,7 @@ jobs:
         env: { RUSTC_STAGE: "2" }
         run: ./build-rustc measure || true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: dist/*
