@@ -189,8 +189,12 @@ pkg_mb() {                                # pkg_mb <prefix> <record>
   local p="$1" rec="$2"
   local list="$p/.trustup-files/$rec"
   [ -f "$list" ] || return 1
+  # du, not stat: everything else here is measured in blocks, and mixing the
+  # two left the rows short of the total by a couple of percent across thirty
+  # thousand small files. xargs may run du more than once, so sum every total.
   ( cd "$p" && grep -v '/$' "$list" | tr '\n' '\0' \
-      | xargs -0 stat -f%z 2>/dev/null | awk '{s+=$1} END {printf "%d", s/1048576}' )
+      | xargs -0 du -ck 2>/dev/null \
+      | awk '$2 == "total" { s += $1 } END { printf "%d", s / 1024 }' )
 }
 
 
@@ -234,11 +238,20 @@ scan_components() {                       # scan_components <prefix> <manifest> 
 
 scan_targets() {                          # scan_targets <prefix> <manifest>
   local q="$1" mf="$2"
-  local tr here="" gone=""
+  local tr rec n here="" gone="" host
+  host="$(host_triple)"
   for tr in $(grep -o '^\[pkg\.rust-std\.target\.[^]]*\]' "$mf" \
               | sed 's/^\[pkg\.rust-std\.target\.//; s/\]$//'); do
     if [ -d "$q/lib/rustlib/$tr/lib" ]
-    then here="$here$(mb "$q/lib/rustlib/$tr") $tr
+    then
+      # Measured from rust-std's own record, not from du of the target
+      # directory. That directory is a container, not a component: rustc puts
+      # rust-objcopy in <triple>/bin, and llvm-tools would go there too, so
+      # sizing the whole directory counts those bytes twice -- once here and
+      # once against the component that installed them.
+      rec="rust-std"; [ "$tr" = "$host" ] || rec="rust-std@$tr"
+      n="$(pkg_mb "$q" "$rec")" || n="$(mb "$q/lib/rustlib/$tr/lib")"
+      here="$here$n $tr
 "
     else gone="$gone- $tr
 "
@@ -531,8 +544,13 @@ info_targets() {
 }
 
 info_components() {
+  # rust-std is not a component beside the targets, it *is* the targets: its
+  # record covers lib/rustlib/<triple>, the same bytes the target rows measure.
+  # Listing both counted the standard library twice and the column stopped
+  # adding up to the toolchain. The targets keep it, because they split it per
+  # architecture; `component list` still shows rust-std, where nothing else does.
   if [ -s "$mf" ]
-  then scan_components "$q" "$mf" "$triple" | info_rows
+  then scan_components "$q" "$mf" "$triple" | grep -v ' rust-std$' | info_rows
   else row components "${have_c:-rustc rust-std cargo}"
   fi
 }
