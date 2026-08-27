@@ -1,51 +1,40 @@
 # tinyrust
 
-Tinyrust is the smallest Rust install for macOS. Get started faster and leaner.
+Tinyrust is the smallest Rust install for macOS.
 
+The standard Rust distribution is a 1.4GB install, before you even start compiling and adding dependencies. Tinyrust brings that down to 262MB, an 81% reduction.
 
-## Get it
+Get started faster and leaner.
 
-    curl -sSfL https://dbarth.github.io/tinyrust/install.sh | sh
-
-## Why tinyrust?
-
-The standard Rust distribution is a 1.4GB install, before you even start compiling and adding dependencies.
-
-Tinyrust brings that down to 262MB, an 81% reduction.
-
-You still get the full rustup/cargo support, so you can add components or
-dependencies as usual:
-
-    rustup component add rust-analyzer-preview
-    cargo add serde
-
-If you want the full standard install, docs and all:
-
-    trustup go full      # 1359 MB, measured, on top of this
-    trustup go tiny      # back to tinyrust
-    trustup trim         # remove the full one again
-
-Both stay installed until you trim, and `go` decides which one runs.
-
-
-## Use it
+## Installation
 
     curl -sSfL https://dbarth.github.io/tinyrust/install.sh | sh
-    cargo new hello && cd hello && cargo run --release
 
 The installer fetches the optimized toolchain and sets up the environment for building.
  - no prompt, a single profile: the tiny one. 
  - installs to `~/.rustup/toolchains/tinyrust`,
  - links into `~/.cargo/bin`,
  - adds that to your shell profile.
- 
-It contains `trustup`, ie "tiny rustup". `rustup` is aliased to `trustup` but does not pretend to be it:
+ - features `trustup`, ie "tiny rustup", aliased to `rustup` to help stay tiny
 
-    $ rustup version
-    trustup 0.1.0
-    rustc 1.98.0-dev at ~/.rustup/toolchains/tinyrust
+You still get the full rustup/cargo support, so you can add components or
+dependencies as usual:
 
-Note: an existing rustup is never touched — its shims are left alone and you use `trustup` by name.
+    rustup component add rust-analyzer-preview
+    rustup target add x86_64-apple-darwin
+    cargo add serde
+
+If you want the full standard install, docs and all:
+
+    trustup go full      # 1359 MB, measured, on top of this
+    trustup go tiny      # back to tinyrust
+
+`trustup go` decides which one runs, both stay installed until you trim:
+
+    trustup trim         # remove the full one again
+
+
+# Usage
 
 | | |
 |---|---|
@@ -53,21 +42,21 @@ Note: an existing rustup is never touched — its shims are left alone and you u
 | `trustup info` | version, toolchain, components, targets, size |
 | `trustup go full \| tiny` | switch between the full toolchain and the tiny one |
 | `trustup trim` | remove what `go full` installed |
-| `trustup update` | tinyrust is replaced whole, not updated |
-| `component add\|list`, `target add\|list` | intercepted: rustup refuses these on a linked toolchain |
+| `component add\|remove\|list`, `target add\|remove\|list` | intercepted: see below |
 | anything else | passed to rustup, fetched on first use |
 
-`component add` resolves three ways and never mixes silently:
+When tiny versions of the toolchain components are available, `component add`
+downloads those. A few are safe to take from the official dist, and it does.
+Anything else is refused: whatever links `librustc_driver` has to be built by
+this compiler.
+
+If you switch between toolchains with `go`, it will ensure no incompatible parts are mixed.
 
 | | |
 |---|---|
-| in this dist | `rustc`, `rust-std`, `cargo`, `clippy-preview`, `rustfmt-preview`, `rust-analyzer-preview`, `miri` |
+| tiny versions | `rustc`, `rust-std`, `cargo`, `clippy-preview`, `rustfmt-preview`, `rust-analyzer-preview`, `miri` |
 | `upstream-ok` | official dist — `rust-docs`, `rustc-docs`, `rust-src`, `llvm-tools-preview` |
 | anything else | refused |
-
-Rust writes the compiler version string into crate metadata: anything loading
-an `.rmeta` or linking `librustc_driver` must be built by *this* compiler (mixing gives `E0514`).
-trustup re-checks each upstream component after unpacking.
 
 
 ## The numbers
@@ -90,25 +79,17 @@ Just for macOS aarch64, rustc 1.98.0, one std target:
 ## What is included?
 
     rustc          the compiler, its LLVM, and rustdoc for doctests
-    rust-std       the standard library, for this machine only
+    rust-std       the standard library, for this machine
     cargo          the build tool
     rust-objcopy   rustc needs it for `strip = true` release profiles
 
-That is the whole default install. Nothing is downloaded until you ask for it,
-with one exception: the first command trustup passes to rustup fetches rustup itself.
+The compiler emits for x86_64 and aarch64 both. We ship only an Apple Silicon installer for now, but `rustup target add x86_64-apple-darwin` adds the other and
+cross-compilation then works for both architectures.
 
+Nothing else is downloaded until you ask for it, with one exception:
+the first command requiring the real `rustup` will fetch it on demand.
 
-## What if I miss something?
-
-Really miss that 1GB of pre-compiled HTML docs?
-
-    rustup component add rust-docs
-
-Need the LSP for your IDE?
-
-    rustup component add rust-analyzer-preview
-
-And the rest:
+Other parts of the toolchain you can add with `rustup component add`:
 
 | | |
 |---|---|
@@ -121,17 +102,19 @@ And the rest:
 `rustup component list` shows what is installed and what else is on offer.
 
 
-## Not done
+## TODO
 
-- No in-place `update`: `trustup install` replaces the toolchain whole.
-- macOS aarch64 only.
+- Installer for Intel Macs, we only have an Apple Silicon installer.
+- Linux support, x86_64 and aarch64.
+- More reporting and cache management, install tiny, stay tiny.
+- In-place `update`: `trustup install` replaces the toolchain whole.
 
 
 # Development
 
 Not needed to use tinyrust. `NOTES.md` has the derivations.
 
-    ./build-rustc llvm           # wasmer's LLVM, pruned: 457 MB -> 768 MB kept
+    ./build-rustc llvm           # wasmer's LLVM: 2.7 GB unpacked -> 768 MB kept
     ./build-rustc fetch          # rust 1.98.0 + cargo submodule
     ./build-rustc configure
     RUSTC_LTO=fat RUSTC_STAGE=2 ./build-rustc build
@@ -194,7 +177,7 @@ instantiation is built from — required, and the reason std cannot go much belo
 ## CI
 
 `llvm.yml` prunes wasmer's LLVM once and publishes it (115 MB packed);
-`release.yml` consumes that and builds the toolchain. macOS specifics: the build
-leaves ~15 GB of intermediates against ~14 GB free on a runner (Xcode is deleted
-first), macOS minutes bill at 10x on private repos, and binaries are ad-hoc
-signed but not notarized.
+`release.yml` consumes that and builds the toolchain. Both run on GitHub's macOS
+runners with third-party actions pinned to commit SHAs. `prepare` checks for the
+~25 GB the build needs and stops if it is not there; nothing on the runner is
+deleted. Binaries are ad-hoc signed but not notarized.
