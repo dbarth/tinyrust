@@ -198,4 +198,8 @@ through its own shim. `llvm-profdata` and `llvm-cov` would be needed for
 - Check whether notarization is needed. Binaries are ad-hoc signed, which is
   enough to run; a browser download would get a Gatekeeper prompt, but `curl`
   does not set the quarantine bit and the installer uses `curl`. Untested.
+- More reporting and cache management, so a Rust install can be kept tiny
+  rather than just installed tiny. `info crates` is written and unwired; the
+  registry cargo fills has no `cargo` command to prune it, and neither `trim`
+  nor rustup touches it.
 - Every Rust release means repeating this. No `rustup update` path.

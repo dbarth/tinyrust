@@ -10,8 +10,8 @@
 #
 # Handles only what rustup cannot do for a linked toolchain. Specifically:
 #
-#   rustup component add N | list
-#   rustup target add T    | list
+#   rustup component add | remove N | list
+#   rustup target    add | remove T | list
 #
 # Anything else goes to rustup: toolchain, doc, run, etc.
 #
@@ -183,6 +183,137 @@ download() {                              # download <label> <url> <out>
   return $rc
 }
 
+# What a component occupies, summed from the record written when it was added.
+# The same record `remove` deletes from, so the two can never disagree.
+pkg_mb() {                                # pkg_mb <prefix> <record>
+  local p="$1" rec="$2"
+  local list="$p/.trustup-files/$rec"
+  [ -f "$list" ] || return 1
+  ( cd "$p" && grep -v '/$' "$list" | tr '\n' '\0' \
+      | xargs -0 stat -f%z 2>/dev/null | awk '{s+=$1} END {printf "%d", s/1048576}' )
+}
+
+
+# A size in six columns whichever unit it needs: "124 MB" or "1.3 GB". The
+# decimal keeps GB three characters wide too, so the digits stay in one column
+# instead of shifting when a figure crosses 1000.
+fmt_mb() {
+  case "$1" in
+    '?') printf '  ??   ' ;;                       # installed, but no record to measure
+    '')  printf '       ' ;;                       # not installed
+    *)   if [ "$1" -ge 1000 ]
+         then awk -v n="$1" 'BEGIN { printf "%2.1f GB", n / 1024 }'
+         else printf ' %3d MB' "$1"
+         fi ;;
+  esac
+}
+
+listrow() { row "$(fmt_mb "$1")" "$2"; }
+
+# One line per entry, "<size> <name>", biggest first and absent last. Size is
+# a number of MB, "?" when installed but with no record to measure it, or "-"
+# when not installed. `list` and `info` render this differently; neither works
+# out for itself what is there.
+scan_components() {                       # scan_components <prefix> <manifest> <triple>
+  local p="$1" mf="$2" triple="$3"
+  local pkg n here="" gone=""
+  for pkg in $(grep -o "^\[pkg\.[^.]*\.target\.$triple\]" "$mf" \
+               | sed "s/^\[pkg\.//; s/\.target\..*//" | sort -u); do
+    if grep -qxF "$pkg" "$p/.trustup-components" 2>/dev/null; then
+      n="$(pkg_mb "$p" "$pkg")" || n="?"
+      here="$here$n $pkg
+"
+    else
+      gone="$gone- $pkg
+"
+    fi
+  done
+  printf '%s' "$here" | sort -rn
+  printf '%s' "$gone"
+}
+
+scan_targets() {                          # scan_targets <prefix> <manifest>
+  local q="$1" mf="$2"
+  local tr here="" gone=""
+  for tr in $(grep -o '^\[pkg\.rust-std\.target\.[^]]*\]' "$mf" \
+              | sed 's/^\[pkg\.rust-std\.target\.//; s/\]$//'); do
+    if [ -d "$q/lib/rustlib/$tr/lib" ]
+    then here="$here$(mb "$q/lib/rustlib/$tr") $tr
+"
+    else gone="$gone- $tr
+"
+    fi
+  done
+  printf '%s' "$here" | sort -rn
+  printf '%s' "$gone"
+}
+
+# `list` shows everything the channel offers, installed or not, and says which
+# in words rather than in a column.
+list_rows() {
+  local n name
+  while read -r n name; do
+    [ -n "${name:-}" ] || continue
+    case "$n" in
+      '-') note "$name" ;;
+      '?') note "$name  (installed)" ;;
+      *)   note "$name  (installed, $n MB)" ;;
+    esac
+  done
+}
+
+list_components() { scan_components "$@" | list_rows; }
+list_targets()    { scan_targets "$@"    | list_rows; }
+
+# `info` shows only what is here, in the size column.
+info_rows() {
+  local n name
+  while read -r n name; do
+    [ -n "${name:-}" ] || continue
+    [ "$n" = "-" ] && continue
+    if [ "$n" = "?" ]; then listrow "?" "$name"; else listrow "$n" "$name"; fi
+  done
+}
+
+# Undo an add. The record written at add time lists exactly what came out of
+# that tarball, so this removes that and nothing else -- no guessing which file
+# belongs to which component, and no rm -rf of a directory two of them share.
+remove_recorded() {                       # remove_recorded <prefix> <record> <label>
+  # Separate statements: bash 3.2 creates every name in a `local` before it
+  # runs the assignments, so referring to an earlier one here is unbound under
+  # `set -u`.
+  local p="$1" rec="$2" label="$3"
+  local list="$p/.trustup-files/$rec"
+  [ -f "$list" ] || die "$label has no file record here, so removing it would be guesswork.
+       Records are written at add time; anything added before that has none.
+       Reinstalling the toolchain resets it."
+  local was; was="$(mb "$p")"
+  # xargs rather than a shell loop: rust-docs is a hundred thousand files.
+  ( cd "$p" && grep -v '/$' "$list" | tr '\n' '\0' | xargs -0 rm -f 2>/dev/null ) || true
+  # Then the directories it made, deepest first. rmdir refuses a non-empty one,
+  # which is exactly the check we want when two components share a parent.
+  ( cd "$p" && grep '/$' "$list" | sed 's|/$||' | sort -r | tr '\n' '\0' \
+      | xargs -0 rmdir 2>/dev/null ) || true
+  rm -f "$list"
+  # It is no longer installed, so it should no longer be listed.
+  if [ -f "$p/.trustup-components" ]; then
+    grep -vxF "$rec" "$p/.trustup-components" > "$list.keep" 2>/dev/null || true
+    mv "$list.keep" "$p/.trustup-components"
+  fi
+  note "$label removed, $(( was - $(mb "$p") )) MB freed"
+}
+
+# A removed component leaves links in ~/.cargo/bin pointing at files that are
+# gone. link_into_path only adds; nothing else would ever clear these.
+prune_links() {
+  local p="$1" f
+  for f in "$CARGO_BIN"/*; do
+    [ -L "$f" ] || continue
+    case "$(readlink "$f")" in "$p"/*) ;; *) continue ;; esac
+    if [ ! -e "$f" ]; then rm -f "$f"; note "unlinked $(basename "$f")"; fi
+  done
+}
+
 fetch_component() {
   local pkg="$1" triple="$2" mf="$3" dest="$4" work="$5" prune="${6:-yes}"
   local url hash tarball got
@@ -199,7 +330,7 @@ fetch_component() {
   ver="${ver#"$pkg"-}"; ver="${ver%-"$triple"}"
   local dlb; dlb="$(stat -f%z "$tarball")"
   DOWNLOADED_B=$(( DOWNLOADED_B + dlb ))
-  local dl=$(( dlb / 1048576 ))
+  local was; was="$(mb "$dest")"
 
   # Verified here rather than trusted: this is the one thing rustup does that
   # a plain download does not.
@@ -213,11 +344,19 @@ fetch_component() {
   # Pruned only for the three that come by default. A component somebody asked
   # for by name is extracted whole -- asking for rust-docs and getting nothing
   # because share/doc is on the skip list would be a poor joke.
+  # -v prints each path as it is extracted, already stripped, and only what
+  # actually came out -- so the record honours the prune list without a second
+  # pass over the archive. This is what makes `component remove` exact.
+  # rust-std is recorded per target: adding a second one must not overwrite the
+  # first one's record.
+  local rec="$pkg"
+  [ "$triple" = "$(host_triple)" ] || rec="$pkg@$triple"
+  mkdir -p "$dest/.trustup-files"
   if [ "$prune" = yes ]; then
-    tar -xJf "$tarball" -C "$dest" --strip-components=2 "${SKIP[@]}"
+    tar -xJvf "$tarball" -C "$dest" --strip-components=2 "${SKIP[@]}" 2>&1
   else
-    tar -xJf "$tarball" -C "$dest" --strip-components=2
-  fi
+    tar -xJvf "$tarball" -C "$dest" --strip-components=2 2>&1
+  fi | sed 's|^x ||' > "$dest/.trustup-files/$rec"
   rm -f "$tarball"
 
   # There is no package database here, so keep the one fact that cannot be
@@ -225,7 +364,9 @@ fetch_component() {
   grep -qxF "$pkg" "$dest/.trustup-components" 2>/dev/null \
     || printf '%s\n' "$pkg" >> "$dest/.trustup-components"
 
-  mark "$TICK" "$pkg" "$dl" "$ver${FROM:+  $FROM}"
+  # What it costs on disk, which is the number that matters afterwards. The
+  # transfer is reported once, as the `downloaded` total.
+  mark "$TICK" "$pkg" "$(( $(mb "$dest") - was ))" "$ver${FROM:+  $FROM}"
 }
 
 cmd_install_direct() {
@@ -364,67 +505,89 @@ info_toolchain() {
   row toolchain "$("$q/bin/rustc" --version 2>/dev/null | awk '{print $2}') at $(tilde "$q")"
 }
 
-info_targets() { row targets "${have_t# }"; }
+# The summary line: which targets are here, no weights. The sizes come later,
+# in the detail block, where every row shares one column.
+info_targets_line() { row targets "${have_t# }"; }
 
-info_installed() {
-  local show="${have_c:-rustc rust-std cargo}"
-  row installed "${show% }"
+# One line, three figures: the toolchain, whatever else sits under $ROOT, and
+# the part of the toolchain no record accounts for. Zero terms are left out
+# rather than printed as noise.
+info_size() {
+  local line="$qmb MB toolchain"
+  local other=$(( tot - qmb + chmb ))
+  [ "$other" -lt 1 ] || line="$line, $other MB other"
+  row installed "$line"
 }
 
-info_size() {
-  if [ "$tot" = "$(mb "$q")" ]
-  then row size "$tot MB"
-  else row size "$(mb "$q") MB toolchain, $tot MB under $(tilde "$ROOT")"
+
+
+# The detail rows, only what is here. Each falls back to bare names offline,
+# where there is no manifest to enumerate against.
+info_targets() {
+  if [ -s "$mf" ]
+  then scan_targets "$q" "$mf" | info_rows
+  else row targets "${have_t# }"
   fi
 }
 
-# What the dist offers that is not here yet, components first and then any
-# target that could be added. Silent when the manifest could not be fetched.
-info_available() {
-  [ -s "$mf" ] || return 0
-  local pkg free_c="" free_t=""
-  for pkg in $(grep -o "^\[pkg\.[^.]*\.target\.$triple\]" "$mf" \
-               | sed "s/^\[pkg\.//; s/\.target\..*//"); do
-    case " $have_c " in *" $pkg "*) ;; *) free_c="$free_c $pkg" ;; esac
-  done
-  for pkg in $(grep -o '^\[pkg\.rust-std\.target\.[^]]*\]' "$mf" \
-               | sed 's/^\[pkg\.rust-std\.target\.//; s/\]$//'); do
-    case " $have_t " in *" $pkg "*) ;; *) free_t="$free_t $pkg" ;; esac
-  done
-  if [ -n "$free_c" ]; then row available "${free_c# }"; fi
-  if [ -n "$free_t" ]; then row "" "${free_t# }"; fi
+info_components() {
+  if [ -s "$mf" ]
+  then scan_components "$q" "$mf" "$triple" | info_rows
+  else row components "${have_c:-rustc rust-std cargo}"
+  fi
+}
+
+# The ten biggest crates cargo has cached. Not ours to remove -- cargo has no
+# command for it either -- but the registry is usually the largest Rust-shaped
+# thing on the disk, and a total says nothing about what is in it. Anything
+# under a megabyte is left out; the tail is hundreds of tiny crates.
+info_crates() {
+  [ -d "$ch/registry/src" ] || return 0
+  local n d
+  while read -r n d; do
+    [ -n "${d:-}" ] && listrow "$n" "$d"
+  done < <(du -sk "$ch"/registry/src/*/* 2>/dev/null \
+           | awk '{ m = int($1 / 1024); if (m >= 1) { sub(/.*\//, "", $2); print m, $2 } }' \
+           | sort -rn | head -10)
 }
 
 # Anything under $ROOT that is not the toolchain: rustup itself, whatever it
 # installed, its download cache. Only worth naming when it is worth removing,
 # and `trim` is what removes it.
-info_extra() {
-  [ "$(( tot - $(mb "$q") ))" -ge 10 ] || return 0
-  local d n extra=""
+info_other() {
+  local d n
   for d in "$ROOT"/cargo "$ROOT"/rustup/toolchains/* \
-           "$ROOT"/rustup/downloads "$ROOT"/rustup/tmp; do
+           "$ROOT"/rustup/downloads "$ROOT"/rustup/tmp \
+           "$ch"/git "$ch"/bin "$ch"/registry; do
     # -L skips the tinyrust symlink rustup keeps beside its own toolchains.
     { [ -d "$d" ] && [ ! -L "$d" ]; } || continue
     n="$(mb "$d")"
     [ "$n" -ge 1 ] || continue
     case "$d" in
-      "$ROOT"/cargo) extra="$extra, rustup $n MB" ;;
-      *)             extra="$extra, $(basename "$d") $n MB" ;;
+      "$ROOT"/cargo)  listrow "$n" "rustup" ;;
+      "$ch"/registry) listrow "$n" "crates" ;;
+      "$ch"/git)      listrow "$n" "git checkouts" ;;
+      "$ch"/bin)      listrow "$n" "binaries" ;;
+      *)              listrow "$n" "$(basename "$d")" ;;
     esac
   done
-  if [ -n "$extra" ]; then row extra "${extra#, }"; fi
 }
 
 cmd_info() {
   local q; q="$(prefix 2>/dev/null)" || q=""
-  say "trustup $TRUSTUP_VERSION"
+  say "trustup - ver. $TRUSTUP_VERSION"
   if [ -z "$q" ] || [ ! -x "$q/bin/rustc" ]; then
     note "no toolchain installed -- run '$(basename "$0") install'"
     return
   fi
 
   # Gathered once, read by the lines below.
-  local tot; tot="$(mb "$ROOT")"
+  # The toolchain is what this project promises to keep small, so it is
+  # measured on its own. Everything else Rust puts on the disk -- rustup, other
+  # toolchains, and the crates cargo downloads -- is "other".
+  local tot qmb ch chmb
+  tot="$(mb "$ROOT")"; qmb="$(mb "$q")"
+  ch="$(dirname "$CARGO_BIN")"; chmb="$(mb "$ch")"
   local triple; triple="$(host_triple)"
   local have_c; have_c="$(tr '\n' ' ' < "$q/.trustup-components" 2>/dev/null)"
   local d have_t=""
@@ -433,7 +596,7 @@ cmd_info() {
     d="${d%/lib}"; have_t="$have_t $(basename "$d")"
   done
   # The one part that touches the network. A failure leaves $mf empty and
-  # info_available says nothing, rather than the command failing.
+  # the lists fall back to bare names, rather than the command failing.
   local work; work="$(mktemp -d)"
   trap 'rm -rf "$work"' RETURN
   local channel; channel="$(cat "$q/.trustup-channel" 2>/dev/null || echo "$CHANNEL")"
@@ -442,11 +605,14 @@ cmd_info() {
 
   # The order of `info`. Rearrange freely.
   info_toolchain
-  info_targets
-  info_installed
-  info_available
+  info_targets_line
   info_size
-  info_extra
+  info_targets
+  info_components
+  note "             -- other ---------------"
+  info_other
+  # kept out until we do "info crates"
+  # info_crates
   check_shims
 }
 
@@ -463,10 +629,26 @@ cmd_target() {
   local verb="${1:-list}"; shift || true
   ours_is_active || passthrough target "$verb" "$@"
   case "$verb" in
-    add|list) ;;
+    add|list|remove) ;;
     *) passthrough target "$verb" "$@" ;;
   esac
   local q; q="$(prefix)"
+
+  if [ "$verb" = remove ]; then
+    local tr host; host="$(host_triple)"
+    [ $# -gt 0 ] || die "target remove needs a triple -- '$(basename "$0") info' lists them"
+    for tr in "$@"; do
+      [ "$tr" != "$host" ] \
+        || die "$tr is the host target -- without it there is nothing to compile with"
+      [ -d "$q/lib/rustlib/$tr" ] || die "$tr is not installed"
+      # A target is one directory and a record; no shared parents to worry about.
+      local was; was="$(mb "$q")"
+      rm -rf "$q/lib/rustlib/$tr" "$q/.trustup-files/rust-std@$tr"
+      note "$tr removed, $(( was - $(mb "$q") )) MB freed"
+    done
+    return
+  fi
+
   local work; work="$(mktemp -d)"
   trap 'rm -rf "$work"' RETURN
   local channel; channel="$(cat "$q/.trustup-channel" 2>/dev/null || echo "$CHANNEL")"
@@ -474,13 +656,10 @@ cmd_target() {
   curl -sSfL -o "$mf" "$DIST/channel-rust-$channel.toml" \
     || die "could not fetch the $channel manifest"
 
+
   if [ "$verb" = list ]; then
-    say "targets on $channel"
-    local tr
-    for tr in $(grep -o '^\[pkg\.rust-std\.target\.[^]]*\]' "$mf" \
-                | sed 's/^\[pkg\.rust-std\.target\.//; s/\]$//'); do
-      if [ -d "$q/lib/rustlib/$tr/lib" ]; then note "$tr  (installed)"; else note "$tr"; fi
-    done
+    say "targets for    $channel"
+    list_targets "$q" "$mf"
     return
   fi
 
@@ -736,15 +915,53 @@ link_into_path() {
 cmd_component() {
   local verb="${1:-list}"; shift || true
   ours_is_active || passthrough component "$verb" "$@"
-  case "$verb" in
-    add|list) ;;
-    *) die "component takes 'add' or 'list', not '$verb'" ;;
+
+  # `--toolchain X` names which toolchain to act on. Ignoring it meant
+  # `component add rust-docs --toolchain nightly` unpacked 893 MB of HTML into
+  # tinyrust instead, and then treated `--toolchain` as a package name.
+  local a args=() want=""
+  while [ $# -gt 0 ]; do
+    a="$1"; shift
+    case "$a" in
+      --toolchain)   want="${1:-}"; shift || true ;;
+      --toolchain=*) want="${a#--toolchain=}" ;;
+      *)             args+=("$a") ;;
+    esac
+  done
+  case "$want" in
+    ""|tinyrust) ;;
+    *) passthrough component "$verb" "${args[@]}" --toolchain "$want" ;;
   esac
-  [ "$verb" = add ] && [ $# -eq 0 ] && die "component add needs a name -- '$0 component list' shows them"
+  set -- ${args[@]+"${args[@]}"}
+  case "$verb" in
+    add|list|remove) ;;
+    *) die "component takes 'add', 'remove' or 'list', not '$verb'" ;;
+  esac
+  [ "$verb" = list ] || [ $# -gt 0 ] \
+    || die "component $verb needs a name -- '$(basename "$0") info' shows what is installed"
 
   local p; p="$(prefix)"
 
   local triple; triple="$(host_triple)"
+
+  if [ "$verb" = remove ]; then
+    local pkg
+    for pkg in "$@"; do
+      # Same -preview resolution as add, so `remove clippy` undoes `add clippy`.
+      [ -f "$p/.trustup-files/$pkg" ] || [ ! -f "$p/.trustup-files/$pkg-preview" ] \
+        || pkg="$pkg-preview"
+      case "$pkg" in
+        rustc|rust-std|cargo)
+          die "$pkg is the toolchain, not an addition to it.
+       Removing it leaves something that cannot compile; delete
+       $(tilde "$p") and reinstall instead." ;;
+      esac
+      remove_recorded "$p" "$pkg" "$pkg"
+    done
+    prune_links "$p"
+    return
+  fi
+
   local channel; channel="$(cat "$p/.trustup-channel" 2>/dev/null || echo "$CHANNEL")"
 
   local work; work="$(mktemp -d)"
@@ -754,21 +971,8 @@ cmd_component() {
     || die "could not fetch the $channel manifest"
 
   if [ "$verb" = list ]; then
-    say "components for $triple on $channel"
-    python3 - "$triple" "$mf" "$p/.trustup-components" <<'INNER'
-import os, re, sys
-triple, mf, have_file = sys.argv[1:4]
-have = set()
-if os.path.exists(have_file):
-    have = {l.strip() for l in open(have_file) if l.strip()}
-s = open(mf, encoding="utf-8").read()
-pat = r'\[pkg\.([^.\]]+)\.target\.' + re.escape(triple) + r'\](.*?)(?=\n\[)'
-for pkg, body in re.findall(pat, s, re.S):
-    if pkg in have:   note = "  (installed)"
-    elif "available = true" in body: note = ""
-    else: note = "  (not on this channel)"
-    print(f"  {pkg}{note}")
-INNER
+    say "components for $channel on $triple"
+    list_components "$p" "$mf" "$triple"
     return
   fi
 
