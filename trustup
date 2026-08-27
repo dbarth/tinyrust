@@ -484,7 +484,7 @@ upstream_is_independent() {
 # rustup error that names neither cause nor cure.
 check_shims() {
   case "$(readlink "$CARGO_BIN/cargo" 2>/dev/null)" in
-    "$ROOT"/cargo/bin/*) ;;
+    "$ROOT"/rustup-bin/bin/*) ;;
     *) return 0 ;;
   esac
   [ -z "${RUSTUP_HOME:-}" ] || return 0
@@ -556,7 +556,7 @@ info_crates() {
 # and `trim` is what removes it.
 info_other() {
   local d n
-  for d in "$ROOT"/cargo "$ROOT"/rustup/toolchains/* \
+  for d in "$ROOT"/rustup-bin "$ROOT"/rustup/toolchains/* \
            "$ROOT"/rustup/downloads "$ROOT"/rustup/tmp \
            "$ch"/git "$ch"/bin "$ch"/registry; do
     # -L skips the tinyrust symlink rustup keeps beside its own toolchains.
@@ -564,7 +564,7 @@ info_other() {
     n="$(mb "$d")"
     [ "$n" -ge 1 ] || continue
     case "$d" in
-      "$ROOT"/cargo)  listrow "$n" "rustup" ;;
+      "$ROOT"/rustup-bin)  listrow "$n" "rustup" ;;
       "$ch"/registry) listrow "$n" "crates" ;;
       "$ch"/git)      listrow "$n" "git checkouts" ;;
       "$ch"/bin)      listrow "$n" "binaries" ;;
@@ -681,14 +681,14 @@ cmd_target() {
 # back to tinyrust means needing the interception again.
 hand_over() {
   local q f base; q="$(prefix)"
-  for f in "$ROOT"/cargo/bin/*; do
+  for f in "$ROOT"/rustup-bin/bin/*; do
     base="$(basename "$f")"
     case "$base" in rustup|trustup) continue ;; esac
     # Only names that are already ours -- pointing at tinyrust, or at these
     # same shims from an earlier handover. A pre-existing rustup's shims are
     # somebody else's toolchain manager, and install promised to leave them be.
     case "$(readlink "$CARGO_BIN/$base" 2>/dev/null)" in
-      "$q"/bin/*|"$ROOT"/cargo/bin/*) ln -sf "$f" "$CARGO_BIN/$base" ;;
+      "$q"/bin/*|"$ROOT"/rustup-bin/bin/*) ln -sf "$f" "$CARGO_BIN/$base" ;;
       "") [ -e "$CARGO_BIN/$base" ] || ln -sf "$f" "$CARGO_BIN/$base" ;;
       *) note "left the existing $base in $CARGO_BIN alone" ;;
     esac
@@ -716,8 +716,8 @@ go_tiny() {
   local q f base; q="$(prefix)"
   # Agree with rustup rather than contradict it: with direct links, `rustup
   # default` stops deciding anything, so leave it pointing where we point.
-  if [ -x "$ROOT/cargo/bin/rustup" ]; then
-    RUSTUP_HOME="$ROOT/rustup" "$ROOT/cargo/bin/rustup" default tinyrust >/dev/null 2>&1 || true
+  if [ -x "$ROOT/rustup-bin/bin/rustup" ]; then
+    RUSTUP_HOME="$ROOT/rustup" "$ROOT/rustup-bin/bin/rustup" default tinyrust >/dev/null 2>&1 || true
   fi
   for f in "$q"/bin/*; do
     [ -x "$f" ] || continue
@@ -736,7 +736,7 @@ go_tiny() {
 go_full() {
   local name="${1:-stable}"
   ensure_rustup go
-  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
+  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/rustup-bin"
   local before; before="$(mb "$ROOT")"
   say "installing $name, full profile -- rustc, cargo, std, docs, rustfmt, clippy"
   "$CARGO_HOME/bin/rustup" toolchain install "$name" --profile default \
@@ -756,8 +756,8 @@ go_full() {
 # Undo `go full`. Only what rustup installed goes -- tinyrust and rustup itself
 # stay, so `go full` can put it back without refetching rustup.
 cmd_trim() {
-  [ -x "$ROOT/cargo/bin/rustup" ] || die "nothing to trim -- no rustup installed here"
-  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
+  [ -x "$ROOT/rustup-bin/bin/rustup" ] || die "nothing to trim -- no rustup installed here"
+  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/rustup-bin"
   local list tc
   list="$("$CARGO_HOME/bin/rustup" toolchain list 2>/dev/null | awk '$1 != "tinyrust" {print $1}')"
 
@@ -766,8 +766,8 @@ cmd_trim() {
   for tc in $list; do note "$tc"; done
   # rustup itself was never part of `go full` -- it arrives on first passthrough
   # -- but leaving 11 MB behind is not "stay tiny", and it is refetched on
-  # demand. $ROOT/cargo is the home ensure_rustup made, not the user's ~/.cargo.
-  note "rustup ($(mb "$ROOT/cargo") MB) -- refetched when a passed-through command needs it"
+  # demand. $ROOT/rustup-bin is where ensure_rustup put it, not the user's ~/.cargo.
+  note "rustup ($(mb "$ROOT/rustup-bin") MB) -- refetched when a passed-through command needs it"
   local ans=""
   if [ -t 0 ]; then
     printf '  proceed? [y/N] '
@@ -781,7 +781,7 @@ cmd_trim() {
   for tc in $list; do
     "$CARGO_HOME/bin/rustup" toolchain uninstall "$tc" >/dev/null 2>&1 || true
   done
-  rm -rf "$ROOT/rustup" "$ROOT/cargo"
+  rm -rf "$ROOT/rustup" "$ROOT/rustup-bin"
   # No rustup means no RUSTUP_HOME line to export.
   write_cargo_env
   total "freed:" "$(( before - $(mb "$ROOT") ))" "(now $(mb "$ROOT") MB total)"
@@ -797,17 +797,17 @@ cmd_help() {
 # quietly adding them to tinyrust instead would be a wrong answer, not a
 # smaller one.
 ours_is_active() {
-  [ -x "$ROOT/cargo/bin/rustup" ] || return 0          # no rustup: all ours
+  [ -x "$ROOT/rustup-bin/bin/rustup" ] || return 0          # no rustup: all ours
   local d
-  d="$(RUSTUP_HOME="$ROOT/rustup" "$ROOT/cargo/bin/rustup" default 2>/dev/null)" || return 0
+  d="$(RUSTUP_HOME="$ROOT/rustup" "$ROOT/rustup-bin/bin/rustup" default 2>/dev/null)" || return 0
   case "$d" in tinyrust*|"") return 0 ;; *) return 1 ;; esac
 }
 
 passthrough() {
   local verb="$1"; shift
   ensure_rustup "$verb"
-  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
-  exec "$ROOT/cargo/bin/rustup" "$verb" "$@"
+  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/rustup-bin"
+  exec "$ROOT/rustup-bin/bin/rustup" "$verb" "$@"
 }
 
 # rustup is fetched the first time a verb needs it, not asked about. It is
@@ -815,7 +815,13 @@ passthrough() {
 # as "tinyrust" and made default, so `rustup show`, `which`, `target add` and
 # the rest operate on this toolchain rather than downloading a second one.
 ensure_rustup() {                         # ensure_rustup <verb, for the message>
-  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/cargo"
+  # This was $ROOT/cargo, named for the CARGO_HOME rustup-init wants rather
+  # than for what lands in it -- a directory called cargo holding no cargo.
+  # Move an existing one rather than leaving 11 MB orphaned under the old name.
+  if [ -d "$ROOT/cargo" ] && [ ! -e "$ROOT/rustup-bin" ]; then
+    mv "$ROOT/cargo" "$ROOT/rustup-bin"
+  fi
+  export RUSTUP_HOME="$ROOT/rustup" CARGO_HOME="$ROOT/rustup-bin"
   if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
     say "first-time use, fetching rustup, for '$1'"
     mkdir -p "$ROOT"
