@@ -159,6 +159,15 @@ jobs:
           ./build-rustc dist
           ls -l dist
 
+      # The packages this job just built, installed and used the way a reader of
+      # the README would. It has caught a component with no entry point
+      # (cargo-miri), a manifest trustup could not parse, and a tree that was
+      # never trimmed -- none of which `verify` or `measure` look at. --dist
+      # repoints the manifest at the local copy, since its URLs are the release
+      # ones and the release does not exist yet.
+      - name: check
+        run: ./check --dist dist
+
       - name: measure
         env: { RUSTC_STAGE: "2" }
         run: ./build-rustc measure || true

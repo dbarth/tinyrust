@@ -4,6 +4,7 @@
 #
 #   ./check                 install from ./dist, exercise it
 #   ./check --published     install the way the README says, from the release
+#   ./check --dist DIR      test a dist directory as built, before it is published
 #   ./check --keep          leave the sandbox behind to poke at
 #   ./check -o net          skip anything that needs the network
 #   ./check -o heavy        skip `go full`, which downloads 1.4 GB
@@ -23,11 +24,12 @@
 set -uo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DIST="local"; KEEP=0; MATCH=""; OMIT=""
+DIST="local"; DISTDIR=""; KEEP=0; MATCH=""; OMIT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --published) DIST=published ;;
     --local)     DIST=local ;;
+    --dist)      shift; DIST=dir; DISTDIR="${1:-}" ;;
     --keep)      KEEP=1 ;;
     -m)          shift; MATCH="${1:-}" ;;
     -o)          shift; OMIT="$OMIT ${1:-}" ;;
@@ -107,7 +109,21 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # without this it goes to the published release instead -- which is how the
 # first run of this file appeared to find a missing cargo-miri that was only
 # missing from 0.1.0.
-[ "$DIST" = local ] && export TRUSTUP_DIST="$SRC/dist"
+case "$DIST" in
+  local) export TRUSTUP_DIST="$SRC/dist" ;;
+  dir)
+    # A dist straight out of `build-rustc dist` carries the URLs it will be
+    # published under, and those 404 until the release exists. The tarballs are
+    # right there, so copy them in and repoint the manifest at the copy. Hashes
+    # are unaffected -- the files are untouched.
+    [ -d "$DISTDIR" ] || { echo "check: no such dist: $DISTDIR" >&2; exit 2; }
+    mkdir -p "$WORK/dist"
+    cp "$DISTDIR"/*.tar.xz "$DISTDIR"/channel-rust-*.toml "$WORK/dist/"
+    sed -i "" "s|xz_url = \"[^\"]*/|xz_url = \"file://$WORK/dist/|" \
+      "$WORK"/dist/channel-rust-*.toml
+    export TRUSTUP_DIST="$WORK/dist"
+    ;;
+esac
 # A real rustup on the machine must not be reached; trustup goes out of its way
 # to leave one alone, and here there is none to leave alone.
 unset RUSTUP_HOME CARGO_HOME RUSTUP_TOOLCHAIN RUSTC CARGO 2>/dev/null || true
@@ -119,12 +135,12 @@ say "tinyrust check  ($DIST dist, sandbox $WORK)"
 say "install"
 
 it "installs without a prompt" "" '
-  case "'"$DIST"'" in
-    local) TINYRUST_SOURCE='"$SRC"' TINYRUST_DIST='"$SRC"'/dist \
-             sh '"$SRC"'/install.sh > install.out 2>&1 ;;
-    *)     curl -sSfL https://dbarth.github.io/tinyrust/install.sh \
-             | sh > install.out 2>&1 ;;
-  esac
+  if [ -n "${TRUSTUP_DIST:-}" ]; then
+    TINYRUST_SOURCE='"$SRC"' TINYRUST_DIST="$TRUSTUP_DIST" \
+      sh '"$SRC"'/install.sh > install.out 2>&1
+  else
+    curl -sSfL https://dbarth.github.io/tinyrust/install.sh | sh > install.out 2>&1
+  fi
   contains install.out "tinyrust installed"
 '
 
@@ -379,12 +395,12 @@ it "fetches the real rustup on demand" "net,heavy" '
 '
 
 it "survives a second install" "" '
-  case "'"$DIST"'" in
-    local) TINYRUST_SOURCE='"$SRC"' TINYRUST_DIST='"$SRC"'/dist \
-             sh '"$SRC"'/install.sh > reinstall.out 2>&1 ;;
-    *)     curl -sSfL https://dbarth.github.io/tinyrust/install.sh \
-             | sh > reinstall.out 2>&1 ;;
-  esac
+  if [ -n "${TRUSTUP_DIST:-}" ]; then
+    TINYRUST_SOURCE='"$SRC"' TINYRUST_DIST="$TRUSTUP_DIST" \
+      sh '"$SRC"'/install.sh > reinstall.out 2>&1
+  else
+    curl -sSfL https://dbarth.github.io/tinyrust/install.sh | sh > reinstall.out 2>&1
+  fi
   contains reinstall.out "tinyrust installed"
   cd hello && cargo build --quiet > again.out 2>&1
 '

@@ -121,11 +121,14 @@ Not needed to use tinyrust.
     ./build-rustc dist-merge OUT IN...   # both hosts into one manifest
     ./check                      # install it in a sandbox and use it
 
+CI runs `check --dist dist` on each host after packaging, so a release cannot
+go out with a component that does not run.
+
 `check` is the scenario a new user walks through — install, hello world, a
 release build with `strip = true`, docs, a dependency, each component we ship,
 the targets we do not — run as tests, in a scratch `$HOME` that leaves the real
 one alone. `-o net` skips what needs the network, `--published` tests the
-release instead of `./dist`.
+release, `--dist DIR` tests a dist that is built but not yet published.
 
 `trustup` installs from the tinyrust release by default. Point it elsewhere with
 `TRUSTUP_DIST=$PWD/dist` to use a local build, and set `TINYRUST_DIST_BASE` when
