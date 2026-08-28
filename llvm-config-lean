@@ -44,14 +44,30 @@ filter() {
 #            -DLLVM_ENABLE_ZSTD=OFF. What we can do is link it statically:
 #            rustc_llvm/build.rs turns an absolute path to a .a in this output
 #            into `cargo:rustc-link-lib=static=zstd` (its own comment uses
-#            libzstd as the example). That removes the dependency on Homebrew's
+#            libzstd as the example). That removes the dependency on a
 #            libzstd.1.dylib, which otherwise leaves the toolchain unable to
-#            run on a machine without Homebrew.
+#            run on a machine without the package manager that put it there.
+#
+# The archive is the one `build-rustc zstd` builds, pinned to a version. No
+# Homebrew probe: a build-host library is exactly what `build-rustc verify`
+# exists to catch, and picking one up here is how it got in. It must also match
+# the host -- an arm64 archive will not link into an x86_64 driver -- so the
+# fallback path carries the triple.
 zstd_archive() {
-  local c
+  local here host c
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd 2>/dev/null)" || here=""
+  # From this LLVM's own arch, not from uname: the archive has to match the
+  # tree being configured. Under Rosetta the two agree, but an x86_64 tree
+  # queried from a native arm shell would otherwise be handed an arm64 archive.
+  case "$(lipo -archs "$REAL" 2>/dev/null)" in
+    *arm64*)  host=aarch64-apple-darwin ;;
+    *x86_64*) host=x86_64-apple-darwin ;;
+    *)        host="" ;;
+  esac
+  # build-rustc exports TINYRUST_ZSTD_A, so it does not matter where this
+  # checkout is. The second is for running llvm-config by hand.
   for c in ${TINYRUST_ZSTD_A:-} \
-           "$(brew --prefix zstd 2>/dev/null)/lib/libzstd.a" \
-           /opt/homebrew/lib/libzstd.a /usr/local/lib/libzstd.a /usr/lib/libzstd.a; do
+           "${TINYRUST_ZSTD:-$here/zstd}/$host/lib/libzstd.a"; do
     [ -n "$c" ] && [ -f "$c" ] && { printf '%s' "$c"; return; }
   done
 }

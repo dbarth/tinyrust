@@ -158,10 +158,47 @@ shipped binary had picked up a Homebrew library that a user would not have:
 resolves to `/usr/lib`, `/System` or the toolchain. It found the third within
 seconds of being written, which is the argument for having it.
 
+For a long time it checked only the *spelling* of a dependency: an absolute
+path had to be `/usr/lib` or `/System`, and anything starting with `@` passed.
+That is not the same as resolving. Repointing the wasmer tools at our own zstd
+gave rust-objcopy `@loader_path/../lib/libzstd.1.dylib`, which is correct
+inside `./llvm` and dangling once the binary is copied into
+`lib/rustlib/<triple>/bin` — where `../lib` is the rust-std directory. verify
+passed it. The binary could not load:
+
+    dyld: Library not loaded: @loader_path/../lib/libzstd.1.dylib
+      tried: '.../bin/../lib/libzstd.1.dylib' (no such file)
+
+and `cargo build --release` with `strip = true` needs exactly that binary. So
+verify now resolves what it checks: `@loader_path` and `@executable_path`
+against the file's own directory, `@rpath` against the binary's `LC_RPATH`
+entries, and it skips a dylib's own install name, which `otool -L` prints
+first and which is not a dependency at all. `bundle` matches — an `@` path is
+left alone only when it resolves.
+
 zstd cannot simply be dropped: `Compression.cpp.o` in `libLLVMSupport.a` is
 pulled in by rustc's own `LLVMRustLLVMHasZstdCompression`. Linking it
 statically costs +0.3 MB. libxml2 was reachable only from
 `libLLVMWindowsManifest.a`, never on the link line, and is simply dropped.
+
+Linking Homebrew's copy statically closed the leak in what we ship, but the
+build still needed Homebrew to have it, and so did every tool in wasmer's LLVM:
+
+    llvm-config.real -> /opt/homebrew/opt/zstd/lib/libzstd.1.dylib
+
+and 15 more the same way. None of them start without that file, which is what
+`brew install zstd` was for. So we build zstd ourselves — `build-rustc zstd`,
+pinned to 1.5.7 and to the hash facebook/zstd publishes, the same release
+Homebrew was giving us. One archive for the driver's static link, one dylib
+that `bundle` puts beside rust-objcopy and that the wasmer tools are repointed
+at with `@loader_path`. `clang -arch` builds either host natively, so the
+Intel library needs no Intel machine.
+
+Nothing now reads /opt/homebrew. Confirmed by dyld rather than by reading
+`otool` output:
+
+    DYLD_PRINT_LIBRARIES=1 llvm/bin/llvm-config.real --version
+    dyld[...]: .../llvm/lib/libzstd.1.dylib
 
 ### llvm-tools: 205.3 MB in, 4.1 MB kept
 
@@ -169,6 +206,41 @@ Bootstrap installs 14 binaries, each statically linking LLVM. `llc` and `opt`
 alone are 118.7 MB and rustc never invokes them — it drives LLVM in-process
 through its own shim. `llvm-profdata` and `llvm-cov` would be needed for
 `-C instrument-coverage`; add them to `RUSTC_LLVM_TOOLS_KEEP`.
+
+### Two hosts, one manifest
+
+Six of the seven components we build are host binaries: rustc and its driver,
+cargo, clippy, rustfmt, rust-analyzer, miri. That is the same fact that makes
+them ours rather than upstream-ok — linking `librustc_driver` is being a host
+binary. `rust-std` is the exception. Its one executable file,
+`libstd-<hash>.dylib`, is target code linked into the user's binary. It never
+runs on the host.
+
+Rust's naming already encodes that split. Each component carries one triple,
+and which one it means is fixed by the component:
+
+    rustc-1.98.0-x86_64-apple-darwin       host
+    cargo-1.98.0-x86_64-apple-darwin       host
+    rust-std-1.98.0-x86_64-apple-darwin    target
+    rust-src-1.98.0                        neither, keyed "*"
+
+There is never a host-plus-target name. `rust-std` does not need one: a std
+artifact is interchangeable across hosts, because compatibility is the rustc
+version string and not the machine that built it. So each target's std is built
+once, by the builder that owns it. We do the same — `TARGETS` defaults to the
+host's own target, and the two jobs never write the same filename.
+
+There is also one manifest, not one per host. `channel-rust-stable.toml` holds
+33 hosts' rustc entries beside 117 targets' rust-std entries, and rustup selects
+by its own host triple. `trustup` already did that, so an Intel install needed
+nothing in `install.sh` — only x86_64 packages in the manifest. `dist-merge`
+unions the two jobs' package blocks and refuses a duplicate key.
+
+wasmer names its LLVM assets the other way round, `llvm-darwin-amd64`: `<os>-
+<arch>` with Go and Docker spellings, the convention for a download rather than
+for a compilation target. It is not a rival standard — their own releases carry
+`darwin-arm64` beside `linux-aarch64`. We keep their name where we fetch it and
+publish under the rust triple.
 
 ## Rejected
 
@@ -186,15 +258,15 @@ through its own shim. `llvm-profdata` and `llvm-cov` would be needed for
 
 ## TODO
 
-- x86_64 host toolchain — a rustc that runs on Intel Macs. std already ships
-  for x86_64; this is the compiler itself, and it needs a macos-13 runner.
 - Linux targets — the backend is already linked in; needs a cross sysroot and
   a cross linker.
-- Build our own LLVM instead of using wasmer's. Three gains: the three unused
+- Build our own LLVM instead of using wasmer's. Four gains: the three unused
   backends stop occupying 15.4 MB of the build tree, `-DLLVM_ENABLE_ZSTD=OFF`
-  removes the zstd reference instead of statically linking it, and we stop
-  depending on someone else's release cadence. Costs a full LLVM build, and
-  changes nothing we ship.
+  removes the zstd reference instead of statically linking it, the 16 tool
+  binaries stop carrying a link to whatever their build machine had installed,
+  and we stop depending on someone else's release cadence. We now build and pin
+  a zstd of our own solely to satisfy a choice made in someone else's build.
+  Costs a full LLVM build, and changes nothing we ship.
 - Check whether notarization is needed. Binaries are ad-hoc signed, which is
   enough to run; a browser download would get a Gatekeeper prompt, but `curl`
   does not set the quarantine bit and the installer uses `curl`. Untested.

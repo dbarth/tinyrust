@@ -3,6 +3,7 @@
 # build-rustc -- build rustc against the lean LLVM in ./llvm, so the linker
 # keeps only what the compiler actually calls.
 #
+#   build-rustc zstd       build the one library our binaries link, pinned
 #   build-rustc llvm       fetch and prune wasmer's LLVM into ./llvm
 #   build-rustc llvm-pack  tar the pruned ./llvm for publishing
 #   build-rustc fetch      clone rust at the pinned version
@@ -13,6 +14,7 @@
 #   build-rustc bundle     pull non-system libs into the toolchain, repoint, re-sign
 #   build-rustc verify     fail if any binary links outside /usr/lib and /System
 #   build-rustc dist       package components + manifest for trustup to install
+#   build-rustc dist-merge OUT IN...  one manifest covering both hosts
 #   build-rustc upstream-ok  sweep the official dist for what is safe to reuse
 #   build-rustc measure    compare the result against the stock toolchain
 #
@@ -23,15 +25,47 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LLVM="${TINYRUST_LLVM:-$HERE/llvm}"
 SRC="$HERE/rust"
 
+say()  { printf '\033[1m%s\033[0m\n' "$*"; }
+note() { printf '  %s\n' "$*"; }
+die()  { printf 'build-rustc: %s\n' "$*" >&2; exit 1; }
+# Every command except dist-merge builds or packages for a host. dist-merge
+# only concatenates manifests, and runs on whatever machine assembles the
+# release -- Linux in CI -- so the host is checked at dispatch, not at load.
+need_host() { [ -n "$HOST" ] || die "cannot build on $(uname -s)/$(uname -m)"; }
+
 # The version the measurements in NOTES.md were taken against, so the
 # comparison is like for like. Its LLVM is 22.1.8, which is what ./llvm is.
 VERSION="${RUSTC_VERSION:-1.98.0}"
-TRIPLE="aarch64-apple-darwin"
-# std is built for each of these. The host stays aarch64 -- this is one
-# compiler that can also emit for x86_64, not two compilers. x86_64-apple-
-# darwin is the cheap second target: the macOS SDK is universal, so no cross
-# sysroot is needed. A Linux target would need one, plus a cross linker.
-TARGETS="${RUSTC_TARGETS:-aarch64-apple-darwin x86_64-apple-darwin}"
+# The machine this compiler will run on. Everything we build except rust-std is
+# a native binary for it -- rustc and its driver, cargo, clippy, rustfmt,
+# rust-analyzer, miri -- which is the same fact that makes them ours to build
+# rather than upstream-ok: linking librustc_driver is being a host binary.
+# Taken from the machine, like trustup's host_triple(), so a build on an Intel
+# Mac produces an Intel toolchain with no flag to remember. RUSTC_HOST overrides
+# it, but only to a host we can actually run the compiler on -- this is not a
+# cross-build.
+host_triple() {
+  case "$(uname -s)/$(uname -m)" in
+    Darwin/arm64)  echo aarch64-apple-darwin ;;
+    Darwin/x86_64) echo x86_64-apple-darwin ;;
+    # Empty rather than fatal, so dist-merge still runs here. need_host stops
+    # everything else.
+    *) echo "" ;;
+  esac
+}
+HOST="${RUSTC_HOST:-$(host_triple)}"
+# std is built for each of these, and `dist` packs one rust-std per target.
+# The default is the host's own target and nothing else, because that is how
+# the official dist is assembled: rust-std is keyed by target, each target's
+# artifact is built exactly once by the builder that owns it, and any rustc of
+# the same version can load it whatever host it was built on. Two hosts each
+# packing both targets would write the same two filenames twice.
+#
+# Adding the other triple here is still useful locally -- the macOS SDK is
+# universal, so x86_64-apple-darwin costs no cross sysroot and gives this tree
+# a working cross-compiler. It just should not be published from both hosts.
+# A Linux target would need a sysroot and a cross linker.
+TARGETS="${RUSTC_TARGETS:-$HOST}"
 # stage1 is built by the downloaded stage0 and is enough to measure. stage2 is
 # built by stage1 -- the compiler compiling itself -- and is what a real
 # distribution ships.
@@ -57,6 +91,20 @@ TOOLS="${RUSTC_TOOLS:-cargo rustdoc}"
 # dist because each links librustc_driver, so the official build of them is
 # tied to the official compiler. See NOTES.md.
 TOOLS_OPTIONAL="${RUSTC_TOOLS_OPTIONAL:-clippy rustfmt rust-analyzer miri}"
+# What to hand `./x build` for those. Bootstrap's clippy step produces
+# cargo-clippy beside clippy-driver, and rustfmt produces cargo-fmt, but
+# cargo-miri is a tool of its own (tool.rs: path "src/tools/miri/cargo-miri").
+# `cargo miri run` is the only way anyone actually invokes miri, so building
+# `miri` alone ships a component that looks installed and has no entry point --
+# `cargo miri` answers "no such command". dist already packs both.
+tool_targets() {
+  local t out=""
+  for t in $TOOLS_OPTIONAL; do
+    out="$out $t"
+    [ "$t" = miri ] && out="$out cargo-miri"
+  done
+  printf '%s' "$out"
+}
 # Of the 14 binaries in the llvm-tools component (205 MB), these are kept.
 # cargo shells out to rust-objcopy to honour `strip` in release profiles.
 # Add llvm-profdata and llvm-cov if you want -C instrument-coverage to be
@@ -67,10 +115,6 @@ LLVM_TOOLS_KEEP="${RUSTC_LLVM_TOOLS_KEEP:-rust-objcopy}"
 # means better optimisation and slower builds; with fat LTO the units are
 # merged anyway, so this mostly affects the pre-LTO stage.
 CGU="${RUSTC_CGU:-}"
-
-say()  { printf '\033[1m%s\033[0m\n' "$*"; }
-note() { printf '  %s\n' "$*"; }
-die()  { printf 'build-rustc: %s\n' "$*" >&2; exit 1; }
 
 check_llvm() {
   [ -x "$LLVM/bin/llvm-config" ] || die "no llvm-config in $LLVM -- see NOTES.md"
@@ -106,9 +150,82 @@ check_llvm() {
 # meant CI could not reproduce it. The tarball is 457 MB and unpacks to 2.7 GB;
 # we keep about 770 MB of it.
 LLVM_RELEASE="${LLVM_RELEASE:-22.x}"
-LLVM_TARBALL="${LLVM_TARBALL:-llvm-darwin-aarch64.tar.xz}"
-LLVM_TRIPLE="${LLVM_TRIPLE:-darwin-aarch64}"
+# Two naming conventions meet here, so translate once and keep them apart.
+# wasmer names release assets <os>-<arch> with Go and Docker spellings
+# (darwin-amd64) -- the convention for "a download for the machine in front of
+# you". Rust names things <arch>-<vendor>-<os>, the GNU config.sub order LLVM
+# uses for llvm::Triple and rustc inherits -- the convention for "a target to
+# compile for", which needs the vendor and ABI fields a two-part name has
+# nowhere to put. Neither is wrong; they answer different questions. We publish
+# under the rust triple, because our artifacts sit beside rustc-$VERSION-$HOST
+# in the same release, and we spell wasmer's name only where we fetch theirs.
+case "$HOST" in
+  aarch64-apple-darwin) LLVM_WASMER_ASSET=llvm-darwin-aarch64.tar.xz ;;
+  x86_64-apple-darwin)  LLVM_WASMER_ASSET=llvm-darwin-amd64.tar.xz ;;
+  *) LLVM_WASMER_ASSET="" ;;
+esac
+LLVM_TARBALL="${LLVM_TARBALL:-$LLVM_WASMER_ASSET}"
 LLVM_URL="${LLVM_URL:-https://github.com/wasmerio/llvm-custom-builds/releases/download/$LLVM_RELEASE/$LLVM_TARBALL}"
+
+# zstd, built here rather than taken from Homebrew. Two binaries need it and
+# neither may depend on a package manager the user does not have:
+#
+#   librustc_driver   links it, because Compression.cpp.o in libLLVMSupport.a
+#                     is pulled in by rustc's LLVMRustLLVMHasZstdCompression.
+#                     llvm-config-lean swaps -lzstd for our archive, which
+#                     rustc_llvm/build.rs turns into a static link.
+#   rust-objcopy      comes out of wasmer's LLVM already linked against their
+#                     build machine's libzstd.1.dylib, so `bundle` copies ours
+#                     in and repoints it.
+#
+# 1.5.7 is the version this was developed against -- Homebrew's zstd 1.5.7_1 is
+# the same upstream release, so nothing changes by building it. The hash is the
+# one facebook/zstd publishes beside the tarball.
+ZSTD_VERSION="${ZSTD_VERSION:-1.5.7}"
+ZSTD_SHA256="eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3"
+ZSTD_URL="${ZSTD_URL:-https://github.com/facebook/zstd/releases/download/v$ZSTD_VERSION/zstd-$ZSTD_VERSION.tar.gz}"
+# Per host: an arm64 archive cannot be linked into an x86_64 driver.
+ZSTD="${TINYRUST_ZSTD:-$HERE/zstd}"
+ZSTD_LIB="$ZSTD/$HOST/lib"
+# llvm-config-lean reads this. Exported rather than looked up there, so the
+# wrapper needs no idea where this checkout is.
+[ -f "$ZSTD_LIB/libzstd.a" ] && export TINYRUST_ZSTD_A="$ZSTD_LIB/libzstd.a"
+
+# Every binary in wasmer's LLVM links their build machine's Homebrew zstd:
+#
+#   llvm-config.real -> /opt/homebrew/opt/zstd/lib/libzstd.1.dylib
+#
+# and 15 others the same way. Without that file none of them even start, which
+# is why this used to begin with `brew install zstd`. Point them at the zstd we
+# built instead -- the same @loader_path trick `bundle` uses on what we ship,
+# applied here to the tools we only build with. The path they name is their
+# machine's, so match on the library rather than on the path: the Intel build
+# names /usr/local, not /opt/homebrew.
+llvm_repoint_zstd() {
+  [ -f "$ZSTD_LIB/libzstd.1.dylib" ] || die "no zstd for $HOST -- run '$0 zstd'"
+  mkdir -p "$LLVM/lib"
+  cp -f "$ZSTD_LIB/libzstd.1.dylib" "$LLVM/lib/libzstd.1.dylib"
+  chmod u+w "$LLVM/lib/libzstd.1.dylib"
+  install_name_tool -id "@rpath/libzstd.1.dylib" "$LLVM/lib/libzstd.1.dylib" 2>/dev/null
+  codesign -f -s - "$LLVM/lib/libzstd.1.dylib" 2>/dev/null
+
+  local f dep n=0
+  for f in "$LLVM"/bin/*; do
+    [ -f "$f" ] || continue
+    case "$(file -b "$f" 2>/dev/null)" in *Mach-O*) ;; *) continue ;; esac
+    while IFS= read -r dep; do
+      # Already repointed -- this is idempotent, and the published pruned tree
+      # comes back through the fast path with the work already done.
+      case "$dep" in @*) continue ;; esac
+      [ "$(basename "$dep")" = libzstd.1.dylib ] || continue
+      chmod u+w "$f"
+      install_name_tool -change "$dep" "@loader_path/../lib/libzstd.1.dylib" "$f" 2>/dev/null
+      codesign -f -s - "$f" 2>/dev/null
+      n=$((n + 1))
+    done < <(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}')
+  done
+  note "zstd     ours, $n binaries repointed"
+}
 
 # The pruned result, published so a toolchain build does not repeat the 2.7 GB
 # unpack. Set TINYRUST_LLVM_URL to one of these and cmd_llvm takes the fast
@@ -118,7 +235,7 @@ cmd_llvm_pack() {
   local v; v="$("$LLVM/bin/llvm-config" --version)"
   # Not dist/: `dist` wipes that directory, and this artifact is published on
   # its own schedule -- it changes only when LLVM does.
-  local out="$HERE/dist-llvm/tinyrust-llvm-$v-$LLVM_TRIPLE.tar.xz"
+  local out="$HERE/dist-llvm/tinyrust-llvm-$v-$HOST.tar.xz"
   mkdir -p "$HERE/dist-llvm"
   say "packing $LLVM"
   ( cd "$(dirname "$LLVM")" && tar cf - "$(basename "$LLVM")" ) | xz -9 -T0 > "$out"
@@ -149,6 +266,7 @@ cmd_llvm() {
     # llvm-config-lean is versioned in this repo, so refresh it rather than
     # trusting whatever the artifact was packed with.
     install -m 755 "$HERE/llvm-config-lean" "$LLVM/bin/llvm-config"
+    llvm_repoint_zstd
     check_llvm
     return
   fi
@@ -184,9 +302,79 @@ cmd_llvm() {
   mv "$LLVM/bin/llvm-config" "$LLVM/bin/llvm-config.real"
   install -m 755 "$HERE/llvm-config-lean" "$LLVM/bin/llvm-config"
 
+  llvm_repoint_zstd
+
   say "done"
   check_llvm
   note "kept $(du -sh "$LLVM" | cut -f1)"
+}
+
+# Build zstd for this host. Two things link it (see the ZSTD block above), and
+# both used to reach into /opt/homebrew, which is a build-host leak by any
+# other name -- `verify` exists because that kept happening. Pinned to one
+# version and one hash, so the toolchain is not at the mercy of whatever a
+# package manager upgraded to this week.
+#
+# Built with `clang -arch`, not under Rosetta: clang is universal and this is
+# plain C, so an Intel libzstd builds natively on Apple Silicon. That makes
+# `RUSTC_HOST=x86_64-apple-darwin $0 zstd` work from an ordinary shell.
+cmd_zstd() {
+  if [ -f "$ZSTD_LIB/libzstd.a" ] && [ "${1:-}" != "--force" ]; then
+    note "zstd already built for $HOST at $ZSTD_LIB -- --force to redo"
+    return
+  fi
+  local arch
+  case "$HOST" in
+    aarch64-*) arch=arm64 ;;
+    x86_64-*)  arch=x86_64 ;;
+    *) die "no clang -arch known for $HOST" ;;
+  esac
+
+  local work; work="$(mktemp -d)"
+  trap 'rm -rf "$work"' RETURN
+
+  say "zstd $ZSTD_VERSION for $HOST"
+  curl -sSfL --retry 3 -o "$work/zstd.tar.gz" "$ZSTD_URL" \
+    || die "could not download $ZSTD_URL"
+  local got; got="$(shasum -a 256 "$work/zstd.tar.gz" | cut -d' ' -f1)"
+  if [ "$ZSTD_VERSION" = 1.5.7 ]; then
+    [ "$got" = "$ZSTD_SHA256" ] || die "sha256 mismatch
+  expected $ZSTD_SHA256
+  got      $got"
+    note "sha256   $got"
+  else
+    # A version bump has to bring its own hash from facebook/zstd's published
+    # .sha256 beside the tarball. Refusing is better than checking nothing.
+    die "ZSTD_SHA256 is pinned to 1.5.7 -- update it for $ZSTD_VERSION ($got)"
+  fi
+
+  tar -xzf "$work/zstd.tar.gz" -C "$work"
+  local src="$work/zstd-$ZSTD_VERSION"
+  [ -d "$src/lib" ] || die "unexpected tarball layout under $work"
+
+  # CC carries -arch so it reaches both the compile and the link. zstd's
+  # Makefile owns CFLAGS, and overriding those would drop its own -O3.
+  say "building libzstd.a and libzstd.1.dylib ($arch)"
+  make -C "$src/lib" -j "$(sysctl -n hw.ncpu)" \
+    CC="clang -arch $arch" libzstd.a libzstd >/dev/null \
+    || die "zstd build failed"
+
+  mkdir -p "$ZSTD_LIB"
+  cp "$src/lib/libzstd.a" "$ZSTD_LIB/libzstd.a"
+  # The dylib ships under its versioned name and is referenced by the soname
+  # libzstd.1.dylib, which is what `bundle` will be looking for.
+  local dylib; dylib="$(find "$src/lib" -maxdepth 1 -name 'libzstd.*.dylib' -type f | head -1)"
+  [ -n "$dylib" ] || die "no dylib built in $src/lib"
+  cp "$dylib" "$ZSTD_LIB/libzstd.1.dylib"
+  install_name_tool -id "@rpath/libzstd.1.dylib" "$ZSTD_LIB/libzstd.1.dylib" 2>/dev/null
+  codesign -f -s - "$ZSTD_LIB/libzstd.1.dylib" 2>/dev/null
+
+  local f
+  for f in "$ZSTD_LIB"/libzstd.a "$ZSTD_LIB"/libzstd.1.dylib; do
+    printf '  %-22s %6.1f MB  %s\n' "$(basename "$f")" \
+      "$(stat -f%z "$f" | awk '{print $1/1048576}')" "$(lipo -archs "$f" 2>/dev/null || echo '?')"
+  done
+  note "at $ZSTD_LIB"
 }
 
 cmd_fetch() {
@@ -227,7 +415,7 @@ download-ci-llvm = false
 
 [build]
 target = [$(for t in $TARGETS; do printf '"%s", ' "$t"; done | sed 's/, $//')]
-host = ["$TRIPLE"]
+host = ["$HOST"]
 # Nothing here needs the docs, and building them is a large part of a full
 # bootstrap.
 docs = false
@@ -273,10 +461,11 @@ cmd_build() {
 
   # llvm-config is wrapped (see llvm/bin/llvm-config): it drops libxml2, which
   # nothing on the link line references, and hands back an absolute path to
-  # libzstd.a so zstd is linked statically rather than against Homebrew's
-  # dylib. No LIBRARY_PATH needed as a result -- if this line still shows a
-  # bare -lzstd, no static libzstd was found and the link will pick up the
-  # dylib instead, leaving the toolchain tied to Homebrew.
+  # our libzstd.a so zstd is linked statically. Checked rather than hoped for:
+  # a bare -lzstd here would link some dylib off the build host and leave the
+  # toolchain unable to run anywhere else, which is the exact class of bug
+  # `verify` was written for.
+  [ -f "$ZSTD_LIB/libzstd.a" ] || die "no zstd for $HOST -- run '$0 zstd'"
   note "system-libs  $("$LLVM/bin/llvm-config" --system-libs --link-static)"
 
   say "building stage$STAGE"
@@ -284,15 +473,15 @@ cmd_build() {
   # also builds rustdoc, and `tools = []` does not suppress it. The toolchain
   # we measure against is rustc + rust-std + cargo with no rustdoc, so leaving
   # it unbuilt is what makes the comparison like for like.
-  ( cd "$SRC" && ./x build --stage "$STAGE" compiler library $TOOLS $TOOLS_OPTIONAL )
+  ( cd "$SRC" && ./x build --stage "$STAGE" compiler library $TOOLS $(tool_targets) )
   # Bootstrap leaves tools in stage<N>-tools-bin; only `./x install` moves them
   # into the sysroot. Place them so the tree is a usable toolchain as built.
-  local tb="$SRC/build/$TRIPLE/stage$STAGE-tools-bin" t src
-  local out_bin="$SRC/build/$TRIPLE/stage$STAGE/bin"
+  local tb="$SRC/build/$HOST/stage$STAGE-tools-bin" t src
+  local out_bin="$SRC/build/$HOST/stage$STAGE/bin"
   for t in $TOOLS; do
     # bootstrap calls rustdoc's binary rustdoc_tool_binary in the tools dir.
     case "$t" in rustdoc) src="$tb/rustdoc_tool_binary" ;; *) src="$tb/$t" ;; esac
-    local dst="$SRC/build/$TRIPLE/stage$STAGE/bin/$t"
+    local dst="$SRC/build/$HOST/stage$STAGE/bin/$t"
     if [ -f "$src" ]; then
       # bootstrap already hardlinks some tools into the sysroot; installing
       # over itself is an error, so only copy when they really differ.
@@ -322,7 +511,7 @@ cmd_build() {
   done
 
   say "built"
-  note "stage$STAGE at $SRC/build/$TRIPLE/stage$STAGE"
+  note "stage$STAGE at $SRC/build/$HOST/stage$STAGE"
   echo
   cmd_bundle
   echo
@@ -335,14 +524,14 @@ cmd_build() {
 # wrong regardless: those archives are linked into user programs and need their
 # symbols. So strip the compiler alone, which is where the 34 MB is.
 cmd_strip() {
-  local out="$SRC/build/$TRIPLE/stage$STAGE"
+  local out="$SRC/build/$HOST/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
   local f before after
   # rust-objcopy comes from ./llvm already stripped, so it is not listed.
   # stage<N>-tools-bin is where the optional tools live and where dist packs
   # them from, so they have to be stripped there too.
   for f in "$out"/lib/librustc_driver-*.dylib "$out"/bin/* \
-           "$SRC/build/$TRIPLE/stage$STAGE-tools-bin"/*; do
+           "$SRC/build/$HOST/stage$STAGE-tools-bin"/*; do
     [ -f "$f" ] || continue
     before=$(stat -f%z "$f")
     # -x removes local symbols and keeps exported ones, which is what a dylib
@@ -358,7 +547,7 @@ cmd_strip() {
 # The llvm-tools component installs 14 binaries, each statically linking LLVM,
 # for 205 MB. Keep only the ones something actually calls.
 cmd_trim() {
-  local out="$SRC/build/$TRIPLE/stage$STAGE"
+  local out="$SRC/build/$HOST/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
   local d f before after kept
   for d in "$out"/lib/rustlib/*/bin; do
@@ -398,7 +587,7 @@ cmd_trim() {
 # `dist` reads. It is slow and rarely needed: run it when adding a component to
 # the dist, or when a new Rust release might have changed one.
 cmd_upstream_ok() {
-  local triple="$TRIPLE"
+  local triple="$HOST"
   local work; work="$(mktemp -d)"
   trap 'rm -rf "$work"' RETURN
   local omf="$work/official.toml"
@@ -478,7 +667,7 @@ cmd_upstream_ok() {
 # a URL and a SHA-256 per component. Point TRUSTUP_DIST at the output directory
 # to install from it.
 cmd_dist() {
-  local out="$SRC/build/$TRIPLE/stage$STAGE"
+  local out="$SRC/build/$HOST/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
   # Published artifacts are always the fat-LTO build: it is worth 15.3 MB
   # across the tools and 5.1 MB on the compiler, and nobody downloading a
@@ -519,7 +708,7 @@ cmd_dist() {
   local ok
   if [ -f "$HERE/upstream-ok" ]
   then ok="$(grep -v '^#' "$HERE/upstream-ok" | grep -v '^$' \
-             | sed 's/.*/"&"/' | paste -sd, - )"
+             | sed 's/.*/"&"/' | paste -sd, - | sed 's/,/, /g')"
   else ok='"cargo", "rust-docs", "rustc-docs", "rust-src", "llvm-tools-preview"'
        note "no upstream-ok file -- using the built-in list; run '$0 upstream-ok'"
   fi
@@ -553,19 +742,19 @@ TOML
   say "packaging stage$STAGE"
   # The compiler, its driver, the bundled libraries it needs, and the
   # per-target binaries (rust-objcopy) that rustc shells out to.
-  local rustc_files="bin/rustc bin/rustdoc lib/rustlib/$TRIPLE/bin"
+  local rustc_files="bin/rustc bin/rustdoc lib/rustlib/$HOST/bin"
   local d
   for d in "$out"/lib/*.dylib; do
     [ -e "$d" ] && rustc_files="$rustc_files lib/$(basename "$d")"
   done
-  pack rustc "$TRIPLE" $rustc_files
-  pack cargo "$TRIPLE" bin/cargo
+  pack rustc "$HOST" $rustc_files
+  pack cargo "$HOST" bin/cargo
 
   # The optional tools, each its own component under the name rustup uses, so
   # `trustup component add clippy-preview` finds it where it expects to.
   # Bootstrap leaves these in stage<N>-tools-bin flat; the component tarball
   # has to put them where the sysroot expects, so each is staged by hand.
-  local tb="$SRC/build/$TRIPLE/stage$STAGE-tools-bin"
+  local tb="$SRC/build/$HOST/stage$STAGE-tools-bin"
   local comp bins have f
   for comp in $TOOLS_OPTIONAL; do
     case "$comp" in
@@ -587,7 +776,7 @@ TOML
       have="$have libexec/rust-analyzer-proc-macro-srv"
     fi
     if [ -n "$have" ]; then
-      PACK_FROM="$dist/.tools" pack "$comp" "$TRIPLE" $have
+      PACK_FROM="$dist/.tools" pack "$comp" "$HOST" $have
     else
       note "$comp not built -- skipped"
     fi
@@ -605,15 +794,88 @@ TOML
   say "install it with"
   note "TRUSTUP_DIST=$dist ./trustup install <dir>"
   note "base $base"
+  note "host $HOST -- merge with the other host's dist before publishing"
+}
+
+# One channel manifest covers every host and every target, which is how the
+# official dist works: a single channel-rust-stable.toml holds 33 hosts' rustc
+# entries beside 117 targets' rust-std entries, and rustup picks by its own
+# host triple. trustup already does the same, so a release needs one merged
+# manifest rather than one per host and an installer that chooses between them.
+#
+#   build-rustc dist-merge OUT IN...
+#
+# Package blocks are keyed [pkg.<name>.target.<triple>] and are unioned. A key
+# in two inputs is a mistake rather than something to resolve quietly: with
+# TARGETS defaulting to the host's own target nothing is built twice, so a
+# duplicate means an input was packed with that overridden.
+cmd_dist_merge() {
+  [ $# -ge 2 ] || die "usage: $0 dist-merge OUT IN [IN...]"
+  local out="$1"; shift
+  local chan="${TINYRUST_CHANNEL:-tinyrust}" d f
+  for d in "$@"; do
+    [ -f "$d/channel-rust-$chan.toml" ] || die "no channel-rust-$chan.toml in $d"
+  done
+
+  mkdir -p "$out"
+  for d in "$@"; do
+    for f in "$d"/*.tar.xz; do
+      [ -e "$f" ] || continue
+      cp -f "$f" "$out/"
+    done
+  done
+
+  say "merging $# manifests"
+  python3 - "$out/channel-rust-$chan.toml" "$chan" "$@" <<'MERGE' || die "merge failed"
+import re, sys
+out, chan, inputs = sys.argv[1], sys.argv[2], sys.argv[3:]
+
+head, blocks, seen = "", [], {}
+for i, d in enumerate(inputs):
+    text = open(f"{d}/channel-rust-{chan}.toml", encoding="utf-8").read()
+    # Everything before the first [pkg...] is the header -- manifest-version,
+    # date, version, upstream-ok. Taken from the first input; the others are
+    # the same build of the same release and are expected to agree.
+    first = re.search(r"^\[pkg\.", text, re.M)
+    top = text[:first.start()] if first else text
+    if i == 0:
+        head = top
+    elif top.strip() != head.strip():
+        print(f"  warning: {d} header differs from {inputs[0]}", file=sys.stderr)
+    for m in re.finditer(r"^(\[pkg\.[^\]]+\])\n(.*?)(?=^\[pkg\.|\Z)",
+                         text, re.M | re.S):
+        key, body = m.group(1), m.group(2)
+        if key in seen:
+            sys.exit(f"  {key} is in both {seen[key]} and {d}")
+        seen[key] = d
+        blocks.append(key + "\n" + body.rstrip("\n") + "\n\n")
+
+with open(out, "w", encoding="utf-8") as f:
+    f.write(head.rstrip("\n") + "\n\n")
+    f.writelines(blocks)
+
+for key in sorted(seen):
+    print(f"  {key[5:-1]:<44} {seen[key]}")
+print(f"  {len(blocks)} packages from {len(inputs)} hosts")
+MERGE
+
+  # pipefail would abort on an empty directory, and an empty merge is worth
+  # saying out loud rather than crashing over.
+  if ls "$out"/*.tar.xz >/dev/null 2>&1; then
+    ls -l "$out"/*.tar.xz | awk '{printf "  %6.1f MB  %s\n", $5/1048576, $NF}'
+  else
+    note "no tarballs in $out"
+  fi
+  say "wrote $out/channel-rust-$chan.toml"
 }
 
 cmd_bundle() {
-  local out="$SRC/build/$TRIPLE/stage$STAGE"
+  local out="$SRC/build/$HOST/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
   # Bundled libraries go in the prefix's own lib/, not beside whatever binary
   # needed them: lib/rustlib/<triple>/lib belongs to the rust-std component, and
   # a file dropped there would straddle two packages when dist splits them.
-  local f dep libdir base rel n=0
+  local f dep libdir base src rel n=0
   libdir="$out/lib"
 
   while IFS= read -r f; do
@@ -622,13 +884,30 @@ cmd_bundle() {
             "$libdir" "$(dirname "$f")")"
     while IFS= read -r dep; do
       case "$dep" in
-        /usr/lib/*|/System/*|@*|"") continue ;;
+        /usr/lib/*|/System/*|"") continue ;;
+        # @rpath is resolved by the loading binary's LC_RPATH, which rust sets
+        # up for its own dylibs. verify checks those.
+        @rpath/*) continue ;;
+        # An @loader_path dep is only fine if it resolves. The wasmer tools
+        # arrive already repointed at ./llvm's own copy of libzstd (see
+        # llvm_repoint_zstd), and that path does not exist inside a toolchain:
+        # rust-objcopy lands in lib/rustlib/<triple>/bin, where ../lib is the
+        # rust-std directory. Left alone it fails to load, and `cargo build
+        # --release` with `strip = true` cannot run it.
+        @loader_path/*|@executable_path/*)
+          [ -e "$(dirname "$f")/${dep#@*path/}" ] && continue ;;
       esac
-      [ -f "$dep" ] || { note "WARNING: $(basename "$f") wants missing $dep"; continue; }
-      mkdir -p "$libdir"
       base="$(basename "$dep")"
+      # wasmer's binaries name their own build machine's paths, and rust-objcopy
+      # is one of them. Where the library is one we build, take ours: it is the
+      # pinned version, it matches the host, and it is there even when that
+      # path is not.
+      src="$dep"
+      [ -f "$ZSTD_LIB/$base" ] && src="$ZSTD_LIB/$base"
+      [ -f "$src" ] || { note "WARNING: $(basename "$f") wants missing $dep"; continue; }
+      mkdir -p "$libdir"
       if [ ! -f "$libdir/$base" ]; then
-        cp -L "$dep" "$libdir/$base"
+        cp -L "$src" "$libdir/$base"
         chmod u+w "$libdir/$base"
         install_name_tool -id "@rpath/$base" "$libdir/$base" 2>/dev/null
         codesign -f -s - "$libdir/$base" 2>/dev/null
@@ -636,7 +915,7 @@ cmd_bundle() {
       chmod u+w "$f"
       install_name_tool -change "$dep" "@loader_path/$rel/$base" "$f" 2>/dev/null
       codesign -f -s - "$f" 2>/dev/null
-      note "bundled $base for $(basename "$f")"
+      note "bundled $base for $(basename "$f")$([ "$src" = "$dep" ] || echo "  (ours, not $(dirname "$dep"))")"
       n=$((n + 1))
     done < <(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}')
   done < <(find "$out/bin" "$out/lib" -type f \( -perm -u+x -o -name '*.dylib' \) 2>/dev/null)
@@ -645,7 +924,7 @@ cmd_bundle() {
 }
 
 cmd_verify() {
-  local out="$SRC/build/$TRIPLE/stage$STAGE"
+  local out="$SRC/build/$HOST/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
   local f dep bad=0 checked=0
 
@@ -656,27 +935,52 @@ cmd_verify() {
       *) continue ;;
     esac
     checked=$((checked + 1))
+    # For a dylib, otool -L opens with the library's own install name. It is
+    # not a dependency and nothing has to resolve it, so take it out before
+    # walking the list.
+    local id=""
+    case "$f" in *.dylib) id="$(otool -D "$f" 2>/dev/null | tail -n +2 | head -1)" ;; esac
+    # LC_RPATH entries, for resolving @rpath. @loader_path inside an rpath is
+    # relative to the binary that carries it.
+    local rpaths; rpaths="$(otool -l "$f" 2>/dev/null \
+      | awk '/LC_RPATH/{r=1} r && /^ *path /{print $2; r=0}')"
     while IFS= read -r dep; do
+      [ -n "$id" ] && [ "$dep" = "$id" ] && continue
       case "$dep" in
-        /usr/lib/*|/System/*|@rpath/*|@loader_path/*|@executable_path/*) ;;
-        "") ;;
+        /usr/lib/*|/System/*|"") continue ;;
+        @loader_path/*|@executable_path/*)
+          # Checking that it resolves, not just that it is spelled with an @.
+          # A dangling @loader_path looks exactly like a correctly bundled one
+          # until the binary is run, and this checked only the spelling until
+          # a repointed rust-objcopy shipped that could not load libzstd.
+          if [ -e "$(dirname "$f")/${dep#@*path/}" ]; then continue; fi
+          printf '  DANGLING  %-24s -> %s\n' "$(basename "$f")" "$dep"
+          bad=$((bad + 1)); continue ;;
+        @rpath/*)
+          local rp found=0
+          for rp in $rpaths; do
+            case "$rp" in @loader_path*) rp="$(dirname "$f")/${rp#@loader_path/}" ;; esac
+            [ -e "$rp/${dep#@rpath/}" ] && { found=1; break; }
+          done
+          [ "$found" = 1 ] && continue
+          printf '  DANGLING  %-24s -> %s\n' "$(basename "$f")" "$dep"
+          bad=$((bad + 1)); continue ;;
         *)
-          printf '  LEAK  %-28s -> %s\n' "$(basename "$f")" "$dep"
-          bad=$((bad + 1))
-          ;;
+          printf '  LEAK      %-24s -> %s\n' "$(basename "$f")" "$dep"
+          bad=$((bad + 1)); continue ;;
       esac
     done < <(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}')
   done < <(find "$out/bin" "$out/lib" -type f \( -perm -u+x -o -name '*.dylib' \) 2>/dev/null)
 
   if [ "$bad" -gt 0 ]; then
-    die "$bad build-host leak(s) across $checked binaries -- see above"
+    die "$bad bad dependencie(s) across $checked binaries -- see above"
   fi
-  say "no build-host leaks"
-  note "$checked Mach-O files, all resolving to /usr/lib, /System or the toolchain"
+  say "every dependency resolves"
+  note "$checked Mach-O files, each one to /usr/lib, /System or inside the toolchain"
 }
 
 cmd_measure() {
-  local out="$SRC/build/$TRIPLE/stage$STAGE"
+  local out="$SRC/build/$HOST/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
   local stock="$HERE/toolchain/rust-stable"
   # CI builds with no stock toolchain to compare against. Print -- rather than
@@ -740,7 +1044,7 @@ cmd_measure() {
   o_all=$(minus "$out" $o_ex)
   # Same capability as stock, i.e. counting only the host target's std.
   o_one=$(minus "$out" $o_ex $(for t in $TARGETS; do
-            [ "$t" = "$TRIPLE" ] || echo "$out/lib/rustlib/$t"; done))
+            [ "$t" = "$HOST" ] || echo "$out/lib/rustlib/$t"; done))
   printf '  %-30s %8s\n' "stock (1 std target)" "$s_tot"
   printf '  %-30s %8s   %s\n' "this build (1 std target)" "$o_one" "$(pct "$s_tot" "$o_one")"
   printf '  %-30s %8s   %s\n' "this build (all $(set -- $TARGETS; echo $#) std targets)" "$o_all" "$(pct "$s_tot" "$o_all")"
@@ -760,6 +1064,12 @@ cmd_measure() {
 }
 
 case "${1:-}" in
+  dist-merge) ;;
+  *) need_host ;;
+esac
+
+case "${1:-}" in
+  zstd)      shift; cmd_zstd "$@" ;;
   llvm)      shift; cmd_llvm "$@" ;;
   llvm-pack) cmd_llvm_pack ;;
   fetch)     cmd_fetch ;;
@@ -769,8 +1079,9 @@ case "${1:-}" in
   trim)      cmd_trim ;;
   bundle)    cmd_bundle ;;
   dist)      cmd_dist ;;
+  dist-merge) shift; cmd_dist_merge "$@" ;;
   upstream-ok) cmd_upstream_ok ;;
   verify)    cmd_verify ;;
   measure)   cmd_measure ;;
-  *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
 esac

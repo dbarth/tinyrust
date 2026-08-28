@@ -11,6 +11,10 @@
 #
 # Fetches trustup and installs the tinyrust toolchain.
 #
+# No architecture to pick here. trustup reads the machine (host_triple) and
+# asks the manifest for that host, the way rustup does; one manifest carries
+# every host we publish.
+#
 
 set -eu
 

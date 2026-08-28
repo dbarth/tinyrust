@@ -33,8 +33,12 @@ If you want the full standard install, docs and all:
 
     trustup trim         # remove the full one again
 
-The compiler emits for x86_64 and aarch64 both. We ship only an Apple Silicon
-installer for now, but `rustup target add x86_64-apple-darwin` adds the other and
+We ship both Apple Silicon and Intel. The installer picks by itself: `trustup`
+reads the machine and asks the manifest for that host, the way `rustup` does.
+There is one install command and no arch to choose.
+
+The compiler emits for x86_64 and aarch64 both, whichever one it runs on.
+`rustup target add x86_64-apple-darwin` adds the other target and
 cross-compilation then works for both architectures.
 
 
@@ -97,7 +101,6 @@ Just for macOS aarch64, rustc 1.98.0, one std target:
 
 ## TODO
 
-- Installer for Intel Macs, we only have an Apple Silicon installer.
 - Linux support, x86_64 and aarch64.
 - More reporting and cache management, install tiny, stay tiny.
 - In-place `update`: `trustup install` replaces the toolchain whole.
@@ -107,6 +110,7 @@ Just for macOS aarch64, rustc 1.98.0, one std target:
 
 Not needed to use tinyrust.
 
+    ./build-rustc zstd           # the one library we link, pinned, no Homebrew
     ./build-rustc llvm           # wasmer's LLVM: 2.7 GB unpacked -> 768 MB kept
     ./build-rustc fetch          # rust 1.98.0 + cargo submodule
     ./build-rustc configure
@@ -114,11 +118,25 @@ Not needed to use tinyrust.
     ./build-rustc trim           # drop the llvm-tools nothing calls
     ./build-rustc strip          # drop symbols from the compiler and tools
     ./build-rustc dist           # tarballs + manifest; refuses non-fat trees
+    ./build-rustc dist-merge OUT IN...   # both hosts into one manifest
+    ./check                      # install it in a sandbox and use it
+
+`check` is the scenario a new user walks through — install, hello world, a
+release build with `strip = true`, docs, a dependency, each component we ship,
+the targets we do not — run as tests, in a scratch `$HOME` that leaves the real
+one alone. `-o net` skips what needs the network, `--published` tests the
+release instead of `./dist`.
 
 `trustup` installs from the tinyrust release by default. Point it elsewhere with
 `TRUSTUP_DIST=$PWD/dist` to use a local build, and set `TINYRUST_DIST_BASE` when
 packaging so the manifest carries the URLs the packages will actually live at —
 without it they point at the build machine.
+
+The build reads the machine it runs on. An Intel Mac produces an Intel
+toolchain with no flag to set. `RUSTC_HOST` overrides it, but only to a host
+that can run the compiler — this is not a cross-build. CI runs one job per
+host and `dist-merge` folds the two dists into the single manifest a release
+serves.
 
 ## How we make Rust tiny
 
@@ -187,8 +205,10 @@ The sweep downloads each official component and applies two rules:
 
 ## No binary links outside the OS
 
-`build-rustc verify` ensures every Mach-O resolves to `/usr/lib`,
-`/System` or the toolchain.
+`build-rustc verify` ensures every Mach-O resolves to `/usr/lib`, `/System` or
+the toolchain — and resolves it, rather than reading the path: `@loader_path`
+and `@rpath` are followed, so a dangling one fails the build instead of
+shipping.
 
 ## CI
 

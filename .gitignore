@@ -1,8 +1,11 @@
 toolchain/
 llvm/
+llvm-*/
 rust/
 build.log
 dist/
-dist-llvm/
+dist-*/
+release/
 .#*
 *~
+zstd/

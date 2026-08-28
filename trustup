@@ -1020,7 +1020,11 @@ cmd_component() {
   # official channel, because it only runs rustc or carries no code at all.
   # Anything else links librustc_driver or loads .rmeta, and the official build
   # of it was compiled by a different rustc -- E0514, not a subtle bug.
-  local ok; ok=" $(sed -n 's/^upstream-ok = \[\(.*\)\]/\1/p' "$mf" | tr -d '",' ) "
+  # tr -d '",' would delete the commas too, gluing ["a","b"] into one token
+  # unless the writer happened to put a space after each one. Turn them into
+  # separators instead: the manifest is data, and its spacing is not a contract.
+  local ok; ok=" $(sed -n 's/^upstream-ok = \[\(.*\)\]/\1/p' "$mf" \
+                   | tr -d '"' | tr ',' ' ') "
   local omf="" pkg
   say "adding to $(tilde "$p")"
   for pkg in "$@"; do

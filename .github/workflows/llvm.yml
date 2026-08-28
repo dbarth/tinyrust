@@ -5,6 +5,14 @@
 #   wasmer tarball   457 MB  ->  2.7 GB unpacked
 #   what we keep     768 MB  ->  115 MB packed
 #
+# Once per host: rustc links these archives statically, so an arm64 LLVM
+# cannot build an Intel compiler. wasmer names its assets <os>-<arch>
+# (darwin-amd64); we republish under the rust triple, because ours sit beside
+# rustc-<version>-<triple> in a release. build-rustc translates between the two.
+#
+# The zstd step comes first: wasmer's binaries all link their build machine's
+# Homebrew libzstd and will not start until they are repointed at ours.
+#
 # Runs on GitHub's macOS runners: free on a public repo, 10x-billed on a
 # private one. Third-party actions are pinned to commit SHAs rather than tags,
 # so a repointed tag cannot change what executes here.
@@ -24,15 +32,22 @@ permissions:
 
 jobs:
   prune:
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: aarch64-apple-darwin
+            runner: macos-15
+          - host: x86_64-apple-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Nothing here deletes anything. The build needs disk and libzstd; check
-      # for both and stop with a message naming the fix. A throwaway runner
-      # that is short of space is a runner-image problem, not something a
-      # workflow should paper over by deleting the developer tools.
+      # Nothing here deletes anything. A throwaway runner that is short of
+      # space is a runner-image problem, not something a workflow should paper
+      # over by deleting the developer tools.
       - name: prepare
         env:
           NEED: "12"       # GB: 2.7 GB unpack plus the 768 MB kept
@@ -41,17 +56,21 @@ jobs:
           echo "$avail GB free, need $NEED"
           [ "$avail" -ge "$NEED" ] || { echo "not enough disk"; exit 1; }
 
-          # wasmer's LLVM binaries link Homebrew's libzstd and macOS ships none.
-          # Installing it is additive, so a throwaway runner may do it; a
-          # developer machine is told what to run instead.
-          if [ -e "$(brew --prefix zstd 2>/dev/null)/lib/libzstd.a" ]; then
-            echo "zstd present"
-          elif [ "$RUNNER_ENVIRONMENT" = github-hosted ]; then
-            brew install zstd
-          else
-            echo "libzstd.a missing -- brew install zstd"; exit 1
-          fi
+      - name: check host
+        run: |
+          case "$(uname -m)/${{ matrix.host }}" in
+            arm64/aarch64-apple-darwin|x86_64/x86_64-apple-darwin) ;;
+            *) echo "runner is $(uname -m), job claims ${{ matrix.host }}"
+               exit 1 ;;
+          esac
 
+      # The only library our binaries link, built here and pinned to a version
+      # and a hash. Must come before `llvm`: wasmer's tools are repointed at it,
+      # and until they are, none of them start.
+      - name: zstd
+        run: ./build-rustc zstd
+
+      # build-rustc reads the host and picks wasmer's matching asset.
       - name: fetch and prune
         env:
           LLVM_RELEASE: ${{ inputs.release }}

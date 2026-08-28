@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+#
+# check -- a user's first hour with tinyrust, run as a test.
+#
+#   ./check                 install from ./dist, exercise it
+#   ./check --published     install the way the README says, from the release
+#   ./check --keep          leave the sandbox behind to poke at
+#   ./check -o net          skip anything that needs the network
+#   ./check -o heavy        skip `go full`, which downloads 1.4 GB
+#   ./check -m doc          run only steps whose name matches
+#
+# Steps share one sandbox and run in order, so -m is for reading a failure, not
+# for running a step on its own: skip the install and the later steps have no
+# toolchain to use.
+#
+# The point is not coverage. It is that a normal "let's try this" session does
+# not hit a face plant: install, hello world, release build, docs, a
+# dependency, the components we ship, the targets we do not. Each step is one
+# `it`, and a step is a user action, not a unit.
+#
+# Nothing touches the real machine. HOME is a scratch directory, so ~/.rustup,
+# ~/.cargo and the shell profile trustup appends to are all inside it.
+set -uo pipefail
+
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DIST="local"; KEEP=0; MATCH=""; OMIT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --published) DIST=published ;;
+    --local)     DIST=local ;;
+    --keep)      KEEP=1 ;;
+    -m)          shift; MATCH="${1:-}" ;;
+    -o)          shift; OMIT="$OMIT ${1:-}" ;;
+    -h|--help)   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "check: unknown option $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ---- the harness ----------------------------------------------------------
+
+PASS=0; FAIL=0; SKIP=0; FAILED=""
+TICK=$(printf '\342\234\223'); CROSS=$(printf '\342\234\227')
+g() { printf '\033[32m%s\033[0m' "$*"; }
+r() { printf '\033[31m%s\033[0m' "$*"; }
+d() { printf '\033[2m%s\033[0m' "$*"; }
+say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+# it <name> <tag,...> <body>
+#
+# The body runs with `set -e` in a subshell, so the first command that fails
+# fails the step. Output is captured and shown only when it does -- a passing
+# step should say nothing but its name.
+it() {
+  local name="$1" tags="$2" body="$3" t0 t1 rc log
+  if [ -n "$MATCH" ] && [[ "$name" != *"$MATCH"* ]]; then return; fi
+  local tag
+  for tag in ${tags//,/ }; do
+    case " $OMIT " in *" $tag "*)
+      printf '  %s %s %s\n' "$(d '-')" "$name" "$(d "(skipped: $tag)")"
+      SKIP=$((SKIP + 1)); return ;;
+    esac
+  done
+  log="$WORK/log/$(printf '%03d' $((PASS + FAIL + 1))).log"
+  t0=$SECONDS
+  ( set -e; cd "$WORK"; eval "$body" ) > "$log" 2>&1
+  rc=$?
+  t1=$((SECONDS - t0))
+  if [ $rc -eq 0 ]; then
+    PASS=$((PASS + 1))
+    printf '  %s %s %s\n' "$(g "$TICK")" "$name" "$(d "${t1}s")"
+  else
+    FAIL=$((FAIL + 1)); FAILED="$FAILED  $name\n"
+    printf '  %s %s %s\n' "$(r "$CROSS")" "$name" "$(r "exit $rc")"
+    sed 's/^/      /' "$log" | tail -20
+  fi
+}
+
+# Assertions, named so a failing step reads like a sentence in the log.
+contains() { # contains <file> <pattern>
+  grep -qE -- "$2" "$1" || { echo "expected /$2/ in:"; cat "$1"; return 1; }
+}
+missing()  { grep -qE -- "$2" "$1" && { echo "did not expect /$2/"; return 1; }; return 0; }
+exists()   { [ -e "$1" ] || { echo "no such path: $1"; return 1; }; }
+refuses()  { # refuses <cmd...> -- must exit non-zero
+  if "$@" > "$WORK/refused" 2>&1; then
+    echo "expected failure, got success:"; cat "$WORK/refused"; return 1
+  fi
+  return 0
+}
+
+# ---- the sandbox ----------------------------------------------------------
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/tinyrust-check.XXXXXX")"
+mkdir -p "$WORK/home" "$WORK/log"
+cleanup() {
+  if [ "$KEEP" = 1 ] || [ "$FAIL" -gt 0 ]; then
+    printf '\n%s\n' "$(d "sandbox kept at $WORK")"
+  else rm -rf "$WORK"; fi
+}
+trap cleanup EXIT
+
+export HOME="$WORK/home"
+export PATH="$HOME/.cargo/bin:$PATH"
+# install.sh turns TINYRUST_DIST into TRUSTUP_DIST for the install and no
+# further. Every later `rustup component add` is trustup invoked directly, and
+# without this it goes to the published release instead -- which is how the
+# first run of this file appeared to find a missing cargo-miri that was only
+# missing from 0.1.0.
+[ "$DIST" = local ] && export TRUSTUP_DIST="$SRC/dist"
+# A real rustup on the machine must not be reached; trustup goes out of its way
+# to leave one alone, and here there is none to leave alone.
+unset RUSTUP_HOME CARGO_HOME RUSTUP_TOOLCHAIN RUSTC CARGO 2>/dev/null || true
+
+say "tinyrust check  ($DIST dist, sandbox $WORK)"
+
+# ---- install --------------------------------------------------------------
+
+say "install"
+
+it "installs without a prompt" "" '
+  case "'"$DIST"'" in
+    local) TINYRUST_SOURCE='"$SRC"' TINYRUST_DIST='"$SRC"'/dist \
+             sh '"$SRC"'/install.sh > install.out 2>&1 ;;
+    *)     curl -sSfL https://dbarth.github.io/tinyrust/install.sh \
+             | sh > install.out 2>&1 ;;
+  esac
+  contains install.out "tinyrust installed"
+'
+
+it "puts the toolchain where rustup would look" "" '
+  exists "$HOME/.rustup/toolchains/tinyrust/bin/rustc"
+  exists "$HOME/.rustup/toolchains/tinyrust/bin/cargo"
+  exists "$HOME/.rustup/toolchains/tinyrust/bin/rustdoc"
+'
+
+it "links into ~/.cargo/bin and the shell profile" "" '
+  exists "$HOME/.cargo/bin/cargo"
+  exists "$HOME/.cargo/bin/rustup"
+  exists "$HOME/.cargo/env"
+  test -L "$HOME/.cargo/bin/rustup"
+'
+
+it "leaves nothing outside the sandbox" "" '
+  test "$(readlink "$HOME/.cargo/bin/cargo")" != ""
+  case "$(readlink "$HOME/.cargo/bin/cargo")" in
+    "$HOME"/*) ;;
+    *) echo "cargo links outside HOME: $(readlink "$HOME/.cargo/bin/cargo")"; exit 1 ;;
+  esac
+'
+
+it "reports a version" "" '
+  rustc --version > v.out 2>&1
+  contains v.out "^rustc 1\."
+  cargo --version >> v.out 2>&1
+  contains v.out "^cargo 1\."
+'
+
+it "shows info without crashing" "" '
+  trustup info > info.out 2>&1
+  contains info.out "rustc"
+  contains info.out "aarch64-apple-darwin|x86_64-apple-darwin"
+'
+
+# `trim` is a separate step from `build`, so it is possible to package a tree
+# that still holds all 15 llvm-tools -- 208 MB of them, llc and opt alone being
+# 118 -- and nothing downstream notices. That shipped twice before this existed.
+it "keeps only the llvm-tool rustc shells out to" "" '
+  p="$HOME/.rustup/toolchains/tinyrust"
+  for d in "$p"/lib/rustlib/*/bin; do
+    [ -d "$d" ] || continue
+    got="$(ls "$d" | tr "\n" " ")"
+    [ "$got" = "rust-objcopy " ] || { echo "$d holds: $got"; exit 1; }
+  done
+'
+
+it "installs in the size the README claims" "" '
+  n=$(du -sm "$HOME/.rustup/toolchains/tinyrust" | awk "{print \$1}")
+  echo "installed ${n} MB"
+  [ "$n" -le 300 ] || { echo "too big: ${n} MB -- README says 262"; exit 1; }
+'
+
+it "ships no binary that links outside the OS" "" '
+  p="$HOME/.rustup/toolchains/tinyrust"
+  bad=0
+  while IFS= read -r f; do
+    case "$(file -b "$f" 2>/dev/null)" in *Mach-O*) ;; *) continue ;; esac
+    id=""; case "$f" in *.dylib) id="$(otool -D "$f" | tail -n +2 | head -1)" ;; esac
+    while IFS= read -r dep; do
+      [ -n "$id" ] && [ "$dep" = "$id" ] && continue
+      case "$dep" in
+        /usr/lib/*|/System/*|"") continue ;;
+        @loader_path/*|@executable_path/*)
+          [ -e "$(dirname "$f")/${dep#@*path/}" ] && continue
+          echo "DANGLING $f -> $dep"; bad=1 ;;
+        @rpath/*) ;;
+        *) echo "LEAK $f -> $dep"; bad=1 ;;
+      esac
+    done < <(otool -L "$f" 2>/dev/null | tail -n +2 | awk "{print \$1}")
+  done < <(find "$p/bin" "$p/lib" -type f \( -perm -u+x -o -name "*.dylib" \) 2>/dev/null)
+  [ "$bad" = 0 ]
+'
+
+# ---- hello world ----------------------------------------------------------
+
+say "build something"
+
+it "creates and runs a new crate" "" '
+  cargo new --quiet hello
+  cd hello
+  cargo run --quiet > run.out 2>&1
+  contains run.out "Hello, world!"
+'
+
+it "builds a release binary with strip = true" "" '
+  cd hello
+  printf "\n[profile.release]\nstrip = true\n" >> Cargo.toml
+  cargo build --release --quiet 2>&1 | tee strip.out
+  missing strip.out "unable to run rust-objcopy"
+  exists target/release/hello
+  ./target/release/hello | grep -q "Hello, world!"
+'
+
+it "runs unit tests" "" '
+  cd hello
+  cat >> src/main.rs <<EOF
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn two() { assert_eq!(1 + 1, 2); }
+}
+EOF
+  cargo test --quiet > test.out 2>&1
+  contains test.out "test result: ok"
+'
+
+it "runs doctests through rustdoc" "" '
+  cd hello
+  cat > src/lib.rs <<EOF
+/// Adds two numbers.
+///
+/// \`\`\`
+/// assert_eq!(hello::add(2, 2), 4);
+/// \`\`\`
+pub fn add(a: i32, b: i32) -> i32 { a + b }
+EOF
+  cargo test --doc --quiet > doc.out 2>&1
+  contains doc.out "test result: ok"
+'
+
+it "builds documentation" "" '
+  cd hello
+  cargo doc --no-deps --quiet > cargodoc.out 2>&1
+  exists target/doc/hello/index.html
+'
+
+it "benchmarks with a harness-free bench target" "" '
+  cd hello
+  mkdir -p benches
+  cat > benches/b.rs <<EOF
+fn main() {
+    let t = std::time::Instant::now();
+    let mut n: u64 = 0;
+    for i in 0..2_000_000u64 { n = n.wrapping_add(i); }
+    println!("sum {} in {:?}", n, t.elapsed());
+}
+EOF
+  printf "\n[[bench]]\nname = \"b\"\nharness = false\n" >> Cargo.toml
+  cargo bench --quiet > bench.out 2>&1
+  contains bench.out "sum .* in "
+'
+
+it "adds a dependency from crates.io" "net" '
+  cd hello
+  cargo add serde --quiet 2>&1 | tee add.out
+  cargo build --quiet > dep.out 2>&1
+  contains Cargo.toml "serde"
+'
+
+# ---- components -----------------------------------------------------------
+
+say "components"
+
+it "lists components, installed and on offer" "" '
+  rustup component list > cl.out 2>&1
+  contains cl.out "clippy-preview"
+  contains cl.out "rustfmt-preview"
+'
+
+it "adds clippy and lints with it" "" '
+  rustup component add clippy-preview > clippy-add.out 2>&1
+  cd hello && cargo clippy --quiet > clippy.out 2>&1
+  missing clippy.out "error: "
+'
+
+it "adds rustfmt and formats with it" "" '
+  rustup component add rustfmt-preview > fmt-add.out 2>&1
+  cd hello
+  # --check first, on the code earlier steps wrote by hand, so the run that
+  # follows has something to do. Then --check again, which must come back clean.
+  cargo fmt --check > before.out 2>&1 || true
+  contains before.out "Diff in"
+  cargo fmt > fmt.out 2>&1
+  cargo fmt --check > after.out 2>&1
+'
+
+it "adds rust-analyzer and it starts" "" '
+  rustup component add rust-analyzer-preview > ra-add.out 2>&1
+  rust-analyzer --version > ra.out 2>&1
+  contains ra.out "rust-analyzer"
+'
+
+# `cargo miri` is the only way anyone runs miri. Shipping bin/miri alone gives
+# a component that lists as installed and answers "no such command" -- which is
+# exactly what this step found the first time it ran.
+it "adds miri and cargo miri works" "" '
+  rustup component add miri > miri-add.out 2>&1
+  exists "$HOME/.rustup/toolchains/tinyrust/bin/miri"
+  exists "$HOME/.rustup/toolchains/tinyrust/bin/cargo-miri"
+  cd hello && cargo miri --version > m.out 2>&1
+  missing m.out "no such command"
+'
+
+it "adds rust-src from the official dist" "net" '
+  rustup component add rust-src > src-add.out 2>&1
+  exists "$HOME/.rustup/toolchains/tinyrust/lib/rustlib/src"
+'
+
+it "removes a component again" "" '
+  rustup component remove miri > rm.out 2>&1
+  test ! -e "$HOME/.rustup/toolchains/tinyrust/bin/miri"
+'
+
+it "still builds after all that" "" '
+  cd hello && cargo build --quiet > after.out 2>&1
+  ./target/debug/hello | grep -q "Hello, world!"
+'
+
+# ---- targets --------------------------------------------------------------
+
+say "targets"
+
+it "lists the targets the dist offers" "" '
+  rustup target list > tl.out 2>&1
+  contains tl.out "aarch64-apple-darwin|x86_64-apple-darwin"
+'
+
+it "refuses a target the dist does not carry" "" '
+  refuses rustup target add x86_64-unknown-linux-gnu
+  contains "$WORK/refused" "no rust-std|not published|does not"
+'
+
+# The interesting one. Until the Intel job has published, an aarch64 release
+# carries no x86_64 std, and the wrong answer is to quietly take the official
+# one -- it would be built by a different compiler and every crate would fail
+# with E0514. So this asserts whichever is true of the dist under test.
+it "cross-compiles, or says why it cannot" "" '
+  host="$(uname -m)"
+  other=x86_64-apple-darwin
+  [ "$host" = x86_64 ] && other=aarch64-apple-darwin
+  if rustup target add "$other" > ta.out 2>&1; then
+    cd hello && cargo build --quiet --target "$other" > cross.out 2>&1
+    exists "target/$other/debug/hello"
+    echo "cross-compiled to $other"
+  else
+    contains ta.out "no rust-std for $other"
+    echo "not published for $other yet, and it said so"
+  fi
+'
+
+# ---- handing over to rustup ----------------------------------------------
+
+say "the rest of rustup"
+
+it "fetches the real rustup on demand" "net,heavy" '
+  rustup toolchain list > tc.out 2>&1
+  contains tc.out "tinyrust"
+'
+
+it "survives a second install" "" '
+  case "'"$DIST"'" in
+    local) TINYRUST_SOURCE='"$SRC"' TINYRUST_DIST='"$SRC"'/dist \
+             sh '"$SRC"'/install.sh > reinstall.out 2>&1 ;;
+    *)     curl -sSfL https://dbarth.github.io/tinyrust/install.sh \
+             | sh > reinstall.out 2>&1 ;;
+  esac
+  contains reinstall.out "tinyrust installed"
+  cd hello && cargo build --quiet > again.out 2>&1
+'
+
+# ---- report ---------------------------------------------------------------
+
+printf '\n'
+if [ "$FAIL" -eq 0 ]; then
+  printf '%s  %d passed' "$(g "$TICK")" "$PASS"
+else
+  printf '%s  %d failed, %d passed' "$(r "$CROSS")" "$FAIL" "$PASS"
+fi
+[ "$SKIP" -gt 0 ] && printf ', %d skipped' "$SKIP"
+printf '\n'
+if [ "$FAIL" -gt 0 ]; then printf '\n%b' "$FAILED"; fi
+exit $(( FAIL > 0 ))
