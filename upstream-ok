@@ -1,0 +1,10 @@
+# Written by `build-rustc upstream-ok`. Do not edit by hand.
+# Official components carrying no .rlib, no .rmeta and no link to
+# librustc_driver -- safe for trustup to fetch upstream.
+cargo
+llvm-bitcode-linker-preview
+llvm-tools-preview
+rust-analysis
+rust-docs
+rust-src
+rustc-docs

@@ -29,14 +29,17 @@ If you want the full standard install, docs and all:
     trustup go full      # 1359 MB, measured, on top of this
     trustup go tiny      # back to tinyrust
 
-`trustup go` decides which one runs, both stay installed until you trim:
+`trustup go` decides which one runs. Both toolcains stay installed until you trim:
 
     trustup trim         # remove the full one again
+
+The compiler emits for x86_64 and aarch64 both. We ship only an Apple Silicon
+installer for now, but `rustup target add x86_64-apple-darwin` adds the other and
+cross-compilation then works for both architectures.
 
 
 # Usage
 
-| | |
 |---|---|
 | `trustup install [DIR]` | fetch the toolchain, no rustup |
 | `trustup info` | version, toolchain, components, targets, size |
@@ -46,18 +49,35 @@ If you want the full standard install, docs and all:
 | anything else | passed to rustup, fetched on first use |
 
 When tiny versions of the toolchain components are available, `component add`
-downloads those. A few are safe to take from the official dist, and it does.
-Anything else is refused: whatever links `librustc_driver` has to be built by
-this compiler.
-
+will download these in priority, or default to official variants otherwise.
 If you switch between toolchains with `go`, it will ensure no incompatible parts are mixed.
 
-| | |
+See the development notes below for the rationale.
+
 |---|---|
 | tiny versions | `rustc`, `rust-std`, `cargo`, `clippy-preview`, `rustfmt-preview`, `rust-analyzer-preview`, `miri` |
-| `upstream-ok` | official dist — `rust-docs`, `rustc-docs`, `rust-src`, `llvm-tools-preview` |
-| anything else | refused |
+| `upstream-ok` | official dist — `cargo`, `rust-docs`, `rustc-docs`, `rust-src`, `rust-analysis`, `llvm-tools-preview`, `llvm-bitcode-linker-preview` |
 
+## What is included?
+
+    rustc          the compiler, its LLVM, and rustdoc for doctests
+    rust-std       the standard library, for this machine
+    cargo          the build tool
+    rust-objcopy   rustc needs it for `strip = true` release profiles
+
+Nothing else is downloaded until you ask for it, with one exception:
+the first command requiring the real `rustup` will fetch it on demand.
+
+Other parts of the toolchain you can add with `rustup component add`:
+
+|---|---|
+| `clippy-preview` | lints, `cargo clippy` |
+| `rustfmt-preview` | `cargo fmt` |
+| `miri` | the interpreter, for UB in unsafe code |
+| `rust-src` | std sources, for IDEs and `-Zbuild-std` |
+| `llvm-tools-preview` | `llvm-cov` and friends, for coverage |
+
+`rustup component list` shows what is installed and what else is on offer.
 
 ## The numbers
 
@@ -75,33 +95,6 @@ Just for macOS aarch64, rustc 1.98.0, one std target:
 | std | 128.9 MB | 111.7 MB | −13% |
 | cargo, rustdoc, rust-objcopy | 77.2 MB | 39.5 MB | −49% |
 
-
-## What is included?
-
-    rustc          the compiler, its LLVM, and rustdoc for doctests
-    rust-std       the standard library, for this machine
-    cargo          the build tool
-    rust-objcopy   rustc needs it for `strip = true` release profiles
-
-The compiler emits for x86_64 and aarch64 both. We ship only an Apple Silicon installer for now, but `rustup target add x86_64-apple-darwin` adds the other and
-cross-compilation then works for both architectures.
-
-Nothing else is downloaded until you ask for it, with one exception:
-the first command requiring the real `rustup` will fetch it on demand.
-
-Other parts of the toolchain you can add with `rustup component add`:
-
-| | |
-|---|---|
-| `clippy-preview` | lints, `cargo clippy` |
-| `rustfmt-preview` | `cargo fmt` |
-| `miri` | the interpreter, for UB in unsafe code |
-| `rust-src` | std sources, for IDEs and `-Zbuild-std` |
-| `llvm-tools-preview` | `llvm-cov` and friends, for coverage |
-
-`rustup component list` shows what is installed and what else is on offer.
-
-
 ## TODO
 
 - Installer for Intel Macs, we only have an Apple Silicon installer.
@@ -112,7 +105,7 @@ Other parts of the toolchain you can add with `rustup component add`:
 
 # Development
 
-Not needed to use tinyrust. `NOTES.md` has the derivations.
+Not needed to use tinyrust.
 
     ./build-rustc llvm           # wasmer's LLVM: 2.7 GB unpacked -> 768 MB kept
     ./build-rustc fetch          # rust 1.98.0 + cargo submodule
@@ -127,8 +120,9 @@ Not needed to use tinyrust. `NOTES.md` has the derivations.
 packaging so the manifest carries the URLs the packages will actually live at —
 without it they point at the build machine.
 
-
 ## How we make Rust tiny
+
+A summary of the optimizations we apply. See NOTES.md` for more details.
 
 ### rustc: −48% on the compiler
 
@@ -137,7 +131,6 @@ We combine several optimizations:
 - only the essential build options
 - static linking
 - LTO fat
-
 
 `librustc_driver` calls 638 of `libLLVM.dylib`'s 158,946 symbols. A shared
 library exports everything; static archives let the linker take only what is
@@ -168,6 +161,29 @@ stays because rustc requires it for `-Cstrip`.
 for precompiled std frames in backtraces. The `.rmeta` is metadata every generic
 instantiation is built from — required, and the reason std cannot go much below
 110 MB.
+
+## What we build, what we reuse
+
+Rust writes the compiler version string into crate metadata. Anything carrying
+compiled Rust has to be built by this compiler. So does anything linking
+`librustc_driver`. Clippy, rustfmt, rust-analyzer and miri all do, so we build
+them.
+
+Docs are HTML. `rust-src` is source text. The LLVM tools are standalone
+binaries. None of that is tied to a compiler, so we take it from the official
+dist unchanged.
+
+We do not keep that list by hand:
+
+    build-rustc upstream-ok      sweep the official dist, write ./upstream-ok
+
+The sweep downloads each official component and applies two rules:
+
+    no .rlib and no .rmeta
+    no Mach-O linking librustc_driver
+
+`trustup` applies the same two rules after unpacking. `dist` reads
+`./upstream-ok`. Re-run the sweep instead of editing it.
 
 ## No binary links outside the OS
 

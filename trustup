@@ -340,7 +340,9 @@ fetch_component() {
   # whole channel. A version there is, in the file name, and it is the thing
   # worth seeing when a component comes from a different dist.
   local ver; ver="$(basename "$url")"; ver="${ver%.tar.xz}"
-  ver="${ver#"$pkg"-}"; ver="${ver%-"$triple"}"
+  # A -preview component ships as <thing>-<version>: llvm-tools-preview arrives
+  # as llvm-tools-1.98.0. Strip whichever prefix is actually on the file.
+  ver="${ver#"$pkg"-}"; ver="${ver#"${pkg%-preview}"-}"; ver="${ver%-"$triple"}"
   local dlb; dlb="$(stat -f%z "$tarball")"
   DOWNLOADED_B=$(( DOWNLOADED_B + dlb ))
   local was; was="$(mb "$dest")"
@@ -472,20 +474,33 @@ cmd_install_direct() {
 # A --rustup install has a real rustup under $ROOT/rustup. A direct install does
 # not, and cannot invent one, so the passthrough says so plainly instead of
 # failing with something obscure.
-# The upstream-ok list is a claim, so check it rather than trust it: a
-# component that turns out to link librustc_driver was compiled against another
-# compiler and will die at exec with a dyld error. Caught here instead.
+# ---- UPSTREAM-OK, runtime half --------------------------------------------
+#
+# The manifest's upstream-ok list is a claim. This checks it after unpacking,
+# by the same two rules `build-rustc upstream-ok` applies before publishing:
+#
+#   1. no .rlib and no .rmeta      compiled Rust carries the compiler version
+#                                  string in its metadata; mixing gives E0514
+#   2. no Mach-O linking           rust-analyzer looks independent and is not:
+#      librustc_driver             it links the driver for proc-macro expansion
+#
+# Change these rules in both files or in neither. build-rustc:cmd_upstream_ok
+# is the other half, and the reason the list is generated rather than typed.
 upstream_is_independent() {
   local pkg="$1" before="$2" after="$3" f bad=""
   # Only what this component just unpacked. The toolchain's own rustc and
   # rustdoc link librustc_driver by design and are not the question.
   while IFS= read -r f; do
     [ -f "$f" ] || continue
+    # Compiled Rust carries the compiler version string in its metadata, so an
+    # rlib or rmeta from another build is E0514 waiting to happen. It links
+    # nothing, so otool would never see it.
+    case "$f" in *.rlib|*.rmeta) bad="$bad $(basename "$f")"; continue ;; esac
     case "$(file -b "$f" 2>/dev/null)" in *Mach-O*) ;; *) continue ;; esac
     otool -L "$f" 2>/dev/null | grep -q 'librustc_driver' && bad="$bad $(basename "$f")"
   done < <(comm -13 "$before" "$after")
   [ -z "$bad" ] && return 0
-  die "$pkg links librustc_driver ($bad ) and was built by a different rustc.
+  die "$pkg is tied to the compiler that built it ($bad ) and that was not this one.
        It is wrongly listed upstream-ok in this dist's manifest. Remove it, and
        reinstall the toolchain to drop what was just unpacked."
 }
@@ -1012,8 +1027,13 @@ cmd_component() {
     # rustup takes the short name and resolves it; the manifest publishes these
     # as <name>-preview. Do the same, rather than making people know which of
     # clippy, rustfmt and rust-analyzer carry the suffix and which do not.
-    if ! grep -qF "[pkg.$pkg.target." "$mf" && grep -qF "[pkg.$pkg-preview.target." "$mf"; then
-      pkg="$pkg-preview"
+    # Look in ours first, then in the upstream-ok list: llvm-tools lives only
+    # there, and checking the manifest alone refused the short name.
+    if ! grep -qF "[pkg.$pkg.target." "$mf"; then
+      if grep -qF "[pkg.$pkg-preview.target." "$mf"
+      then pkg="$pkg-preview"
+      else case "$ok" in *" $pkg-preview "*) pkg="$pkg-preview" ;; esac
+      fi
     fi
     # Not everything with a name is a component. rustdoc ships inside rustc,
     # and rustc and cargo are the toolchain -- refusing those as "unsafe to

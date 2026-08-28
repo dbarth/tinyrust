@@ -13,6 +13,7 @@
 #   build-rustc bundle     pull non-system libs into the toolchain, repoint, re-sign
 #   build-rustc verify     fail if any binary links outside /usr/lib and /System
 #   build-rustc dist       package components + manifest for trustup to install
+#   build-rustc upstream-ok  sweep the official dist for what is safe to reuse
 #   build-rustc measure    compare the result against the stock toolchain
 #
 # See NOTES.md for why this should work and what it cannot fix.
@@ -377,6 +378,85 @@ cmd_trim() {
   done
 }
 
+# ---- UPSTREAM-OK -----------------------------------------------------------
+#
+# A component may be taken from the official dist only if nothing in it is tied
+# to the compiler that built it. Two rules decide, and they are the same two
+# `trustup`'s upstream_is_independent() applies after unpacking -- one before
+# publishing, one at install time, so a wrong list cannot reach a user:
+#
+#   1. no .rlib and no .rmeta      compiled Rust carries the compiler version
+#                                  string in its metadata; mixing gives E0514
+#   2. no Mach-O linking           rust-analyzer looks independent and is not:
+#      librustc_driver             it links the driver for proc-macro expansion
+#
+# Change these rules in both files or in neither. trustup:upstream_is_independent
+# is the runtime half.
+#
+# This sweep downloads each candidate from the official dist, unpacks it to a
+# temporary directory and applies the rules. It writes ./upstream-ok, which
+# `dist` reads. It is slow and rarely needed: run it when adding a component to
+# the dist, or when a new Rust release might have changed one.
+cmd_upstream_ok() {
+  local triple="$TRIPLE"
+  local work; work="$(mktemp -d)"
+  trap 'rm -rf "$work"' RETURN
+  local omf="$work/official.toml"
+  say "official manifest"
+  curl -sSfL -o "$omf" "https://static.rust-lang.org/dist/channel-rust-stable.toml" \
+    || die "could not fetch the official manifest"
+
+  # Everything the official dist publishes, for this target and for "*".
+  local cands
+  cands="$(grep -o '^\[pkg\.[^.]*\.target\.' "$omf" \
+           | sed 's/^\[pkg\.//; s/\.target\.$//' | sort -u)"
+
+  local pkg url tar dir verdict bad keep=""
+  for pkg in $cands; do
+    url="$(sed -n "/^\[pkg\.$pkg\.target\.$triple\]/,/^\[/p" "$omf" \
+           | sed -n 's/^xz_url = "\(.*\)"/\1/p' | head -1)"
+    [ -n "$url" ] || url="$(sed -n "/^\[pkg\.$pkg\.target\.\"\*\"\]/,/^\[/p" "$omf" \
+           | sed -n 's/^xz_url = "\(.*\)"/\1/p' | head -1)"
+    [ -n "$url" ] || continue
+
+    rm -rf "$work/x"; mkdir -p "$work/x"
+    tar="$work/c.tar.xz"
+    curl -sSfL -o "$tar" "$url" 2>/dev/null || { printf '  %-22s %s\n' "$pkg" "download failed"; continue; }
+    tar -xJf "$tar" -C "$work/x" --strip-components=2 2>/dev/null || true
+    rm -f "$tar"
+
+    bad=""
+    # Rule 1: compiled Rust.
+    if find "$work/x" \( -name '*.rlib' -o -name '*.rmeta' \) -print -quit | grep -q .; then
+      bad="carries rlib/rmeta"
+    else
+      # Rule 2: anything linking the driver.
+      local f
+      while IFS= read -r f; do
+        case "$(file -b "$f" 2>/dev/null)" in *Mach-O*) ;; *) continue ;; esac
+        if otool -L "$f" 2>/dev/null | grep -q 'librustc_driver'; then
+          bad="links librustc_driver ($(basename "$f"))"; break
+        fi
+      done < <(find "$work/x" -type f)
+    fi
+
+    if [ -z "$bad" ]
+    then verdict="ok"; keep="$keep$pkg
+"
+    else verdict="$bad"
+    fi
+    printf '  %-22s %s\n' "$pkg" "$verdict"
+  done
+
+  {
+    printf '# Written by `build-rustc upstream-ok`. Do not edit by hand.\n'
+    printf '# Official components carrying no .rlib, no .rmeta and no link to\n'
+    printf '# librustc_driver -- safe for trustup to fetch upstream.\n'
+    printf '%s' "$keep"
+  } > "$HERE/upstream-ok"
+  say "wrote $(grep -vc '^#' "$HERE/upstream-ok") entries to ./upstream-ok"
+}
+
 # Every shipped binary must resolve only against the OS. Anything under
 # /opt/homebrew, /usr/local or a build directory is a build-host leak: the
 # artifact works here and fails on a machine without that library. This has
@@ -432,18 +512,18 @@ cmd_dist() {
   #   $ our-rustc --sysroot <official toolchain> hello.rs
   #   error[E0514]: found crate `std` compiled by an incompatible version of rustc
   #
-  # Everything else is only a program that runs rustc, or inert content, and
-  # can come from the official dist unchanged -- official cargo drives this
-  # rustc correctly, tested. This list is what trustup is allowed to fetch
-  # upstream; anything else absent from this manifest is refused rather than
-  # silently mixed.
-  # Only entries checked to carry no link to librustc_driver. rust-analyzer
-  # looks independent and is not: the toolchain build links librustc_driver for
-  # proc-macro expansion, so the official one dies with
-  #   dyld: Library not loaded: @rpath/librustc_driver-4031c0ff8e88f5d1.dylib
-  # against this compiler. trustup re-checks after fetching regardless.
-  printf 'upstream-ok = ["cargo", "rust-docs", "rustc-docs", "rust-src", ' >> "$mf"
-  printf '"llvm-tools-preview"]\n\n' >> "$mf"
+  # Which official components trustup may fetch instead of ours. Determined
+  # mechanically by `build-rustc upstream-ok`, which downloads each candidate
+  # and applies the same two rules trustup applies after unpacking. Do not edit
+  # the list by hand: re-run the sweep. See UPSTREAM-OK above.
+  local ok
+  if [ -f "$HERE/upstream-ok" ]
+  then ok="$(grep -v '^#' "$HERE/upstream-ok" | grep -v '^$' \
+             | sed 's/.*/"&"/' | paste -sd, - )"
+  else ok='"cargo", "rust-docs", "rustc-docs", "rust-src", "llvm-tools-preview"'
+       note "no upstream-ok file -- using the built-in list; run '$0 upstream-ok'"
+  fi
+  printf 'upstream-ok = [%s]\n\n' "$ok" >> "$mf"
 
   pack() { # pack <pkg> <triple> <files...>   (relative to $PACK_FROM)
     local pkg="$1" tri="$2"; shift 2
@@ -689,6 +769,7 @@ case "${1:-}" in
   trim)      cmd_trim ;;
   bundle)    cmd_bundle ;;
   dist)      cmd_dist ;;
+  upstream-ok) cmd_upstream_ok ;;
   verify)    cmd_verify ;;
   measure)   cmd_measure ;;
   *) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
