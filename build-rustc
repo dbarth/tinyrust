@@ -379,6 +379,15 @@ llvm_repoint_zstd() {
     note "zstd     distro libzstd.so.1, build only -- nothing shipped links it"
     return
   fi
+  # An LLVM built -DLLVM_ENABLE_ZSTD=OFF references none, so there is nothing
+  # to repoint and no archive to require.
+  local b need=0
+  for b in "$LLVM"/bin/*; do
+    [ -f "$b" ] || continue
+    case "$(otool -L "$b" 2>/dev/null)" in *libzstd*) need=1; break ;; esac
+  done
+  if [ "$need" = 0 ]; then note "zstd     not linked by this llvm"; return; fi
+
   [ -f "$ZSTD_LIB/libzstd.1.dylib" ] || die "no zstd for $HOST -- run '$0 zstd'"
   mkdir -p "$LLVM/lib"
   cp -f "$ZSTD_LIB/libzstd.1.dylib" "$LLVM/lib/libzstd.1.dylib"
@@ -664,7 +673,9 @@ cmd_build() {
   # a bare -lzstd here would link some dylib off the build host and leave the
   # toolchain unable to run anywhere else, which is the exact class of bug
   # `verify` was written for.
-  [ -f "$ZSTD_LIB/libzstd.a" ] || die "no zstd for $HOST -- run '$0 zstd'"
+  case "$("$LLVM/bin/llvm-config" --system-libs --link-static)" in
+    *zstd*) [ -f "$ZSTD_LIB/libzstd.a" ] || die "no zstd for $HOST -- run '$0 zstd'" ;;
+  esac
   note "system-libs  $("$LLVM/bin/llvm-config" --system-libs --link-static)"
 
   say "building stage$STAGE"

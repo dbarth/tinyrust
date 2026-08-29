@@ -1,55 +1,38 @@
 # Build a tinyrust toolchain and attach it to a release.
 #
-# Runs on GitHub's macOS runners: free on a public repo, 10x-billed on a
-# private one. Third-party actions are pinned to commit SHAs rather than tags,
-# so a repointed tag cannot change what executes here.
+# Two builds per host. The first links the -minsizerel LLVM and produces every
+# component; the second links the -O3 one and contributes a single file, the
+# driver, as rustc-alt. The second is a relink in name only -- changing
+# rustc_llvm invalidates the crate graph and fat LTO links the whole thing
+# again -- so a host job is ~50 minutes, not ~30.
 #
-# Nothing outside the runner workspace is written or deleted: build-rustc
-# confines itself to its own directory and mktemp -d, and `prepare` only
-# reports what is missing.
+# The awkward parts:
 #
-# The awkward parts, all of them macOS-specific:
-#
-#   disk    the build leaves ~15 GB of intermediates for 233 MB of output, so
-#           `prepare` refuses to start under 25 GB. The LLVM comes in
-#           pre-pruned from the llvm workflow, so no runner sees the 2.7 GB
-#           unpack. macos-14-arm64/20260629 reported 72 GB free *after* Xcode
-#           was deleted; nothing deletes it now, so if `prepare` ever fails
-#           here, Xcode is why and NEED is the knob. The Intel image is the
-#           untested one: macos-15-intel is a standard runner, free on a public
-#           repo, but documented at 14 GB of storage against a NEED of 25. If
-#           the x86_64 job stops at `prepare`, that is why, and the answer is a
-#           larger runner rather than deleting the runner's tools.
-#   arch    one job per host, because rustc, cargo and the four optional tools
-#           are native binaries for the machine that built them. macos-15 is
-#           arm64 and macos-15-intel is x86_64; macos-13 is gone and macos-14
-#           is deprecated. ubuntu-24.04-arm and ubuntu-latest are the two Linux
-#           hosts. Each job packs only its own rust-std -- that artifact is
-#           keyed by target and built once, by the host that owns it -- and
-#           `dist-merge` folds the four into the one manifest trustup fetches.
-#           Nothing in the installer chooses: trustup already picks by its own
-#           host triple.
+#   llvm    the unsuffixed artifact is -O3 and builds rustc-alt; -minsizerel
+#           builds the default rustc. `dist-alt` refuses a driver that is not
+#           the larger of the two, which is what catches them being swapped.
+#   disk    the build leaves ~15 GB of intermediates for 250 MB of output, so
+#           `prepare` refuses to start under 25 GB. The Intel image is the
+#           tight one: macos-15-intel is documented at 14 GB. If the x86_64 job
+#           stops at `prepare`, that is why, and the answer is a larger runner
+#           rather than deleting the runner's tools.
+#   arch    one job per host, because rustc, cargo and the optional tools are
+#           native binaries for the machine that built them. Each job packs
+#           only its own rust-std -- that artifact is keyed by target and built
+#           once, by the host that owns it -- and `dist-merge` folds the four
+#           into the one manifest trustup fetches.
 #   image   the Linux jobs build inside ./Dockerfile via ./build-env, and the
-#           macOS jobs run on the runner. That is not symmetry for its own
-#           sake: the glibc a binary is built against is the oldest system it
-#           will run on, so leaving it to the runner image would make the
-#           floor drift when GitHub updates one. macOS has no such knob --
-#           the SDK is the platform.
+#           macOS jobs run on the runner. The glibc a binary is built against
+#           is the oldest system it will run on, so leaving it to the runner
+#           image would make the floor drift when GitHub updates one. macOS has
+#           no such knob -- the SDK is the platform.
 #   memory  fat LTO links librustc_driver in one process against the whole of
 #           LLVM's static archives. It does not fit in 7 GB: a laptop VM that
-#           size is OOM-killed at exactly that step. The hosted runners have
-#           16 GB and no desktop competing for it, which is why this is built
-#           here and not locally.
-#   clean   checkout wipes untracked files, so a self-hosted run refetches
-#           rust/ each time. That is the price of not building on stale state;
-#           llvm/ comes back from the cache.
-#   zstd    wasmer's LLVM binaries link their build machine's Homebrew, and
-#           librustc_driver links zstd too. Both now use the one `build-rustc
-#           zstd` builds, pinned, so no runner installs anything.
-#   signing binaries are ad-hoc signed by `build-rustc bundle`. That is enough
-#           to run, but not notarized: a user who downloads the tarball in a
-#           browser gets a Gatekeeper prompt. curl does not set the quarantine
-#           bit, which is why the installer uses it.
+#           size is OOM-killed at exactly that step.
+#   signing binaries are ad-hoc signed by `build-rustc bundle`. Enough to run,
+#           but not notarized: a browser download would get a Gatekeeper
+#           prompt. curl does not set the quarantine bit, which is why the
+#           installer uses it.
 name: release
 
 env:
@@ -62,7 +45,7 @@ on:
         description: "release tag to publish to"
         required: true
   # No push trigger. Releases are dispatched by hand, so a stray tag cannot
-  # start a 36-minute build.
+  # start an hour-long build.
 
 # Default repo token is read-only; creating a release needs this.
 permissions:
@@ -72,10 +55,9 @@ jobs:
   build:
     strategy:
       # Let the other hosts finish rather than cancelling them, so one failure
-      # reports every result. It does not make the release partial: `publish`
-      # needs the whole matrix, and that is deliberate. Each host owns one
-      # rust-std, so a partial release would carry no std for the missing one
-      # -- worse for cross-compiling than shipping nothing. All hosts or none.
+      # reports every result. `publish` needs the whole matrix regardless: each
+      # host owns one rust-std, so a partial release would carry no std for the
+      # missing one. All hosts or none.
       fail-fast: false
       matrix:
         include:
@@ -105,8 +87,8 @@ jobs:
           echo "$avail GB free, need $NEED"
           [ "$avail" -ge "$NEED" ] || { echo "not enough disk"; exit 1; }
 
-      # Confirm the runner is the host this job claims. A relabelled image
-      # would otherwise build an arm64 toolchain and publish it as Intel.
+      # A relabelled image would otherwise build an arm64 toolchain and publish
+      # it as Intel.
       - name: check host
         run: |
           case "$(uname -s)/$(uname -m)/${{ matrix.host }}" in
@@ -117,50 +99,32 @@ jobs:
             *) echo "runner is $(uname -s)/$(uname -m), job claims ${{ matrix.host }}"
                exit 1 ;;
           esac
-          echo "$(uname -s)/$(uname -m) is ${{ matrix.host }}"
 
-      # The only library our binaries link, built here and pinned to a version
-      # and a hash. Must come before `llvm`: wasmer's tools are repointed at it,
-      # and until they are, none of them start.
-      - name: zstd
-        run: ./build-env ./build-rustc zstd
-
-      # The pruned artifact from the llvm workflow: 115 MB, unpacking to 768 MB.
-      # Without it this step is a 457 MB download and a 2.7 GB unpack. Keyed by
-      # host: an arm64 LLVM cannot link an Intel compiler.
-      - name: cache llvm
-        id: llvm-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: llvm
-          key: llvm-${{ env.LLVM_VERSION }}-${{ matrix.host }}-v1
-
-      # A private repo's releases/download/... URL 404s even with a token --
-      # only the API asset endpoint serves it, which is what `gh release
-      # download` uses. build-rustc takes a file:// URL, so it stays unaware.
-      # Once the repo is public the plain URL works and this can go back.
+      # Both, now, and copied into the workspace: build-env mounts the working
+      # tree and nothing else.
       - name: fetch llvm
-        if: steps.llvm-cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          ASSET: tinyrust-llvm-${{ env.LLVM_VERSION }}-${{ matrix.host }}.tar.xz
         run: |
-          gh release download llvm-22.x --repo "$GITHUB_REPOSITORY" \
-            --pattern "$ASSET" --dir "$RUNNER_TEMP" --clobber
-          # Copied in rather than read from RUNNER_TEMP: build-env mounts the
-          # working tree and nothing else.
-          cp "$RUNNER_TEMP/$ASSET" "$ASSET"
-          TINYRUST_LLVM_URL="file://$PWD/$ASSET" ./build-env ./build-rustc llvm
-          rm -f "$ASSET"
+          for a in tinyrust-llvm-$LLVM_VERSION-${{ matrix.host }}-minsizerel.tar.xz \
+                   tinyrust-llvm-$LLVM_VERSION-${{ matrix.host }}.tar.xz; do
+            gh release download llvm-$LLVM_VERSION --repo "$GITHUB_REPOSITORY" \
+              --pattern "$a" --dir "$RUNNER_TEMP" --clobber
+            cp "$RUNNER_TEMP/$a" "$a"
+          done
 
       - name: fetch rust
         run: ./build-env ./build-rustc fetch
+
+      # ---- the default toolchain, against the -minsizerel llvm -------------
 
       - name: build
         env:
           RUSTC_LTO: fat       # dist refuses anything else
           RUSTC_STAGE: "2"
         run: |
+          TINYRUST_LLVM_URL="file://$PWD/tinyrust-llvm-$LLVM_VERSION-${{ matrix.host }}-minsizerel.tar.xz" \
+            ./build-env ./build-rustc llvm --force
           ./build-env ./build-rustc configure
           ./build-env ./build-rustc build
 
@@ -183,28 +147,45 @@ jobs:
           ./build-env ./build-rustc dist
           ls -l dist
 
-      # The packages this job just built, installed and used the way a reader of
-      # the README would. It has caught a component with no entry point
-      # (cargo-miri), a manifest trustup could not parse, and a tree that was
-      # never trimmed -- none of which `verify` or `measure` look at. --dist
-      # repoints the manifest at the local copy, since its URLs are the release
-      # ones and the release does not exist yet.
+      - name: measure
+        env: { RUSTC_STAGE: "2" }
+        run: ./build-env ./build-rustc measure || true
+
+      # ---- the alternative driver, against the -O3 llvm --------------------
+
+      - name: build rustc-alt
+        env:
+          RUSTC_LTO: fat
+          RUSTC_STAGE: "2"
+          TINYRUST_DIST_BASE: https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag || github.ref_name }}
+        run: |
+          TINYRUST_LLVM_URL="file://$PWD/tinyrust-llvm-$LLVM_VERSION-${{ matrix.host }}.tar.xz" \
+            ./build-env ./build-rustc llvm --force
+          ./build-env ./build-rustc configure
+          ./build-env ./build-rustc build
+          ./build-env ./build-rustc strip
+          mkdir -p alt
+          cp rust/build/${{ matrix.host }}/stage2/lib/librustc_driver-* alt/
+          ./build-env ./build-rustc dist-alt
+          ls -l dist
+
+      # The packages this job just built, installed and used the way a reader
+      # of the README would. It has caught a component with no entry point, a
+      # manifest trustup could not parse, and a tree that was never trimmed --
+      # none of which `verify` or `measure` look at. --dist repoints the
+      # manifest at the local copy, since its URLs are the release ones and the
+      # release does not exist yet.
       - name: check
         run: ./build-env ./check --dist dist
 
-      # The other machine a Linux user might have: no compiler, no python3,
-      # an older glibc than the build image. The install has to work there and
-      # the build has to say why it cannot. Runs on the runner rather than
+      # The other machine a Linux user might have: no compiler, no python3, an
+      # older glibc than the build image. Runs on the runner rather than
       # through build-env, because it starts containers of its own.
       - name: check on a bare machine
         if: runner.os == 'Linux'
         run: |
           ./check --in debian:12-slim --dist dist
           ./check --in rockylinux:9 --dist dist
-
-      - name: measure
-        env: { RUSTC_STAGE: "2" }
-        run: ./build-env ./build-rustc measure || true
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
