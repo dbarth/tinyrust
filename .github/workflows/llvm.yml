@@ -1,58 +1,47 @@
-# Prune wasmer's LLVM once and publish the result, so toolchain builds do not
-# repeat a 457 MB download and a 2.7 GB unpack every time. Re-run only when
-# LLVM_RELEASE changes.
+# Build the LLVM the toolchain links against and publish it, so a toolchain
+# build does not repeat it. Re-run only when the version changes.
 #
-#   wasmer tarball   457 MB  ->  2.7 GB unpacked
-#   what we keep     768 MB  ->  115 MB packed
+# Eight jobs: four hosts, twice each. rustc links these archives statically, so
+# an arm64 LLVM cannot build an Intel compiler, and the two build types are the
+# two components a release carries. No suffix is -O3 and builds rustc-alt;
+# -minsizerel builds the default rustc.
 #
-# Once per host: rustc links these archives statically, so an arm64 LLVM
-# cannot build an Intel compiler. wasmer names its assets <os>-<arch>
-# (darwin-amd64, linux-aarch64); we republish under the rust triple, because
-# ours sit beside rustc-<version>-<triple> in a release. build-rustc translates
-# between the two.
+#   per job    ~7 min, ~3 GB peak
+#   asset      tinyrust-llvm-<version>-<host>[-minsizerel].tar.xz, 49-62 MB
 #
-# The zstd step comes first: on macOS wasmer's binaries all link their build
-# machine's Homebrew libzstd and will not start until they are repointed at
-# ours. On Linux they link the ordinary libzstd.so.1 that the build image
-# installs, so nothing is repointed there -- but the archive is built anyway,
-# because the toolchain build that follows links it statically.
+# No zstd step: -DLLVM_ENABLE_ZSTD=OFF, so nothing links it. That is the whole
+# reason `build-rustc zstd` is no longer on the path here.
 #
-# Runs on GitHub's hosted runners: free on a public repo, 10x-billed on a
-# private one. Third-party actions are pinned to commit SHAs rather than tags,
-# so a repointed tag cannot change what executes here. The Linux jobs go
-# through ./build-env, so the pruning happens in the same pinned image the
-# toolchain is later built in -- wasmer's llvm-config needs glibc 2.34 and
-# will not start on anything older.
+# Third-party actions are pinned to commit SHAs rather than tags, so a
+# repointed tag cannot change what executes. The Linux jobs go through
+# ./build-env, so the archives are built in the same pinned image the toolchain
+# is later built in -- that image is what fixes the glibc floor.
 name: llvm
 
 on:
   workflow_dispatch:
     inputs:
-      release:
-        description: "wasmer llvm-custom-builds release (e.g. 22.x)"
-        default: "22.x"
+      version:
+        description: "LLVM release tag to build (e.g. 22.1.8)"
+        default: "22.1.8"
 
-# Default repo token is read-only, which is what failed the first run at the
-# upload step after six minutes of work.
+# Default repo token is read-only; publishing needs this.
 permissions:
   contents: write
 
 jobs:
-  prune:
+  build:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - host: aarch64-apple-darwin
-            runner: macos-15
-          - host: x86_64-apple-darwin
-            runner: macos-15-intel
-          - host: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-          - host: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+        build_type: [Release, MinSizeRel]
+        host:
+          - { triple: aarch64-apple-darwin,      runner: macos-15 }
+          - { triple: x86_64-apple-darwin,       runner: macos-15-intel }
+          - { triple: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - { triple: x86_64-unknown-linux-gnu,  runner: ubuntu-latest }
+    runs-on: ${{ matrix.host.runner }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -61,7 +50,7 @@ jobs:
       # over by deleting the developer tools.
       - name: prepare
         env:
-          NEED: "12"       # GB: 2.7 GB unpack plus the 768 MB kept
+          NEED: "10"       # GB: 1.5 source, 1.1 build, 0.4 staged, with room
         run: |
           # -k rather than -g: BSD df has no -g on Linux and GNU df has no -g
           # at all. 1024-blocks are the one unit both agree on.
@@ -69,33 +58,34 @@ jobs:
           echo "$avail GB free, need $NEED"
           [ "$avail" -ge "$NEED" ] || { echo "not enough disk"; exit 1; }
 
+      # A relabelled image would otherwise publish an arm64 LLVM as Intel.
       - name: check host
         run: |
-          case "$(uname -s)/$(uname -m)/${{ matrix.host }}" in
+          case "$(uname -s)/$(uname -m)/${{ matrix.host.triple }}" in
             Darwin/arm64/aarch64-apple-darwin) ;;
             Darwin/x86_64/x86_64-apple-darwin) ;;
             Linux/aarch64/aarch64-unknown-linux-gnu) ;;
             Linux/x86_64/x86_64-unknown-linux-gnu) ;;
-            *) echo "runner is $(uname -s)/$(uname -m), job claims ${{ matrix.host }}"
+            *) echo "runner is $(uname -s)/$(uname -m), job claims ${{ matrix.host.triple }}"
                exit 1 ;;
           esac
 
-      # The only library our binaries link, built here and pinned to a version
-      # and a hash. Must come before `llvm`: wasmer's tools are repointed at it,
-      # and until they are, none of them start.
-      - name: zstd
-        run: ./build-env ./build-rustc zstd
+      # The Linux image carries both already; the macOS runners carry cmake but
+      # not always ninja.
+      - name: ninja
+        if: runner.os == 'macOS'
+        run: command -v ninja >/dev/null || brew install ninja
 
-      # build-rustc reads the host and picks wasmer's matching asset.
-      - name: fetch and prune
+      - name: build
         env:
-          LLVM_RELEASE: ${{ inputs.release }}
-        run: ./build-env ./build-rustc llvm
+          LLVM_VERSION: ${{ inputs.version }}
+          LLVM_BUILD_TYPE: ${{ matrix.build_type }}
+        run: ./build-env ./build-llvm
 
-      - run: ./build-env ./build-rustc llvm-pack
-
+      # One tag holds all eight: the names differ by host and build type, so
+      # nothing collides and a re-run of one job replaces only its own asset.
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          tag_name: llvm-${{ inputs.release }}
+          tag_name: llvm-${{ inputs.version }}
           files: dist-llvm/*
           fail_on_unmatched_files: true
