@@ -2,7 +2,7 @@ toolchain/
 llvm/
 llvm-*/
 rust/
-build.log
+*.log
 dist/
 dist-*/
 release/

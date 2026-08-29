@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+#
+# Fork of wasmerio/llvm-custom-builds/build.sh. Two targets, no clang, no lld,
+# nothing auto-detected. Produces the artifact build-rustc consumes:
+#
+#   TINYRUST_LLVM_URL="file://$PWD/dist-llvm/<asset>" ./build-rustc llvm --force
+#
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSION="${1:-${LLVM_VERSION:-22.1.8}}"
+BUILD_TYPE="${LLVM_BUILD_TYPE:-Release}"   # MinSizeRel is -Os
+TARGETS="${LLVM_TARGETS:-X86;AArch64}"
+JOBS="${LLVM_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}"
+
+case "$(uname -s)/$(uname -m)" in
+  Darwin/arm64)  HOST=aarch64-apple-darwin ;;
+  Darwin/x86_64) HOST=x86_64-apple-darwin ;;
+  Linux/aarch64) HOST=aarch64-unknown-linux-gnu ;;
+  Linux/x86_64)  HOST=x86_64-unknown-linux-gnu ;;
+  *) echo "cannot build on $(uname -s)/$(uname -m)" >&2; exit 1 ;;
+esac
+
+SRC="$HERE/llvm-src"
+BLD="$HERE/llvm-build/$BUILD_TYPE"
+# Not under $BLD: llvm-config found inside a build tree reports build-tree paths.
+STAGE="$HERE/llvm-stage/$BUILD_TYPE"
+SUFFIX=""; [ "$BUILD_TYPE" = Release ] || SUFFIX="-$(echo "$BUILD_TYPE" | tr 'A-Z' 'a-z')"
+ASSET="$HERE/dist-llvm/tinyrust-llvm-$VERSION-$HOST$SUFFIX.tar.xz"
+
+# The 14 bootstrap copies into the sysroot (LLVM_TOOLS in bootstrap/src/lib.rs).
+TOOLS="llvm-config llvm-cov llvm-nm llvm-objcopy llvm-objdump llvm-profdata
+       llvm-readobj llvm-size llvm-strip llvm-ar llvm-as llvm-dis llvm-link
+       llc opt"
+
+if [ ! -d "$SRC/.git" ]; then
+  git clone -b "llvmorg-$VERSION" --single-branch --depth=1 \
+    --filter=blob:none --sparse https://github.com/llvm/llvm-project.git "$SRC"
+  git -C "$SRC" sparse-checkout set cmake llvm third-party
+fi
+
+mkdir -p "$BLD"
+cd "$BLD"
+cmake -G Ninja \
+  -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+  -DCMAKE_INSTALL_PREFIX="/" \
+  -DCMAKE_INSTALL_LIBDIR=lib \
+  -DCMAKE_INSTALL_INCLUDEDIR=usr/include \
+  -DLLVM_TARGETS_TO_BUILD="$TARGETS" \
+  -DLLVM_ENABLE_ZSTD=OFF \
+  -DLLVM_ENABLE_ZLIB=OFF \
+  -DLLVM_ENABLE_LIBXML2=OFF \
+  -DLLVM_ENABLE_LIBEDIT=OFF \
+  -DLLVM_ENABLE_LIBPFM=OFF \
+  -DLLVM_ENABLE_FFI=OFF \
+  -DLLVM_ENABLE_Z3_SOLVER=OFF \
+  -DLLVM_ENABLE_BACKTRACES=OFF \
+  -DLLVM_ENABLE_CRASH_OVERRIDES=OFF \
+  -DLLVM_ENABLE_PLUGINS=OFF \
+  -DLLVM_APPEND_VC_REV=OFF \
+  -DLLVM_OPTIMIZED_TABLEGEN=ON \
+  -DLLVM_INCLUDE_DOCS=OFF \
+  -DLLVM_INCLUDE_EXAMPLES=OFF \
+  -DLLVM_INCLUDE_BENCHMARKS=OFF \
+  -DLLVM_INCLUDE_TESTS=OFF \
+  -DLLVM_INCLUDE_UTILS=OFF \
+  -DLLVM_DISTRIBUTION_COMPONENTS="llvm-headers;llvm-libraries;cmake-exports;$(echo $TOOLS | tr ' ' ';')" \
+  "$SRC/llvm"
+
+rm -rf "$STAGE"
+DESTDIR="$STAGE" ninja -j "$JOBS" install-distribution-stripped
+
+# Same as upstream: the prefix "/" puts the tools in usr/bin.
+mkdir -p "$STAGE/bin"
+mv "$STAGE"/usr/bin/* "$STAGE/bin/"
+rmdir "$STAGE/usr/bin"
+ln -sf llvm-ar "$STAGE/bin/llvm-ranlib"
+mv "$STAGE/bin/llvm-config" "$STAGE/bin/llvm-config.real"
+install -m 755 "$HERE/llvm-config-lean" "$STAGE/bin/llvm-config"
+
+echo "version  $("$STAGE/bin/llvm-config.real" --version)"
+echo "targets  $("$STAGE/bin/llvm-config.real" --targets-built)"
+echo "syslibs  $("$STAGE/bin/llvm-config.real" --system-libs --link-static)"
+echo "archives $(ls "$STAGE"/lib/*.a | wc -l | tr -d ' ')"
+echo "tree     $(du -sh "$STAGE" | cut -f1)"
+
+mkdir -p "$(dirname "$ASSET")"
+work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
+cp -R "$STAGE" "$work/llvm"
+( cd "$work" && tar cf - llvm ) | xz -9 -T0 > "$ASSET"
+ls -l "$ASSET" | awk '{printf "%.0f MB  %s\n", $5/1048576, $NF}'
+echo
+echo "TINYRUST_LLVM_URL=\"file://$ASSET\" ./build-rustc llvm --force"
