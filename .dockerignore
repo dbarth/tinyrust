@@ -1,0 +1,5 @@
+# The build image needs the Dockerfile and nothing else. Without this, every
+# ./build-env call re-sends the working tree as build context -- which after
+# `fetch` is a 484 MB rust checkout and after `llvm` another 904 MB.
+*
+!Dockerfile

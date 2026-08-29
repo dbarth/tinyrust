@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+#
+# build-env -- run a build step in the environment it is meant for.
+#
+#   ./build-env ./build-rustc build
+#   ./build-env ./check --dist dist
+#
+# On macOS that environment is this machine. The SDK, the linker, codesign and
+# lipo are the platform; there is nothing to containerise and nothing that
+# would make two Macs disagree.
+#
+# On Linux it is the image in ./Dockerfile, and that is not a convenience. The
+# glibc a binary is built against becomes the oldest system it will run on, so
+# leaving it to whatever the runner or the laptop happens to be would make the
+# floor a property of the machine. Pinned to Ubuntu 22.04, it is a property of
+# this repository, and `build-rustc verify` checks the result against it.
+#
+# The same wrapper is what CI runs, so a failure here is reproducible there and
+# the other way round.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMAGE="${TINYRUST_BUILD_IMAGE:-tinyrust-build:local}"
+
+[ $# -gt 0 ] || { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+
+if [ "$(uname -s)" != Linux ]; then
+  exec "$@"
+fi
+
+command -v docker >/dev/null 2>&1 \
+  || { echo "build-env: docker is needed to build for Linux" >&2; exit 1; }
+
+# Cheap after the first time: every layer is cached, and the Dockerfile
+# changes about as often as the LLVM version does.
+docker build -q -t "$IMAGE" "$HERE" >/dev/null
+
+# Everything build-rustc reads. Forwarded by prefix rather than named one at a
+# time, so a new knob does not have to be added here as well.
+env_args=()
+while IFS='=' read -r k _; do
+  case "$k" in RUSTC_*|TINYRUST_*|LLVM_*|ZSTD_*|GH_TOKEN|GITHUB_*) env_args+=(-e "$k") ;; esac
+done < <(env)
+
+# As the invoking user, so a local run does not leave root-owned files in the
+# working tree. HOME is set because bootstrap and cargo both want one and the
+# container has no passwd entry for this uid.
+exec docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp \
+  "${env_args[@]}" \
+  -v "$HERE:$HERE" -w "$HERE" \
+  "$IMAGE" "$@"

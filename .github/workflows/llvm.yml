@@ -7,15 +7,22 @@
 #
 # Once per host: rustc links these archives statically, so an arm64 LLVM
 # cannot build an Intel compiler. wasmer names its assets <os>-<arch>
-# (darwin-amd64); we republish under the rust triple, because ours sit beside
-# rustc-<version>-<triple> in a release. build-rustc translates between the two.
+# (darwin-amd64, linux-aarch64); we republish under the rust triple, because
+# ours sit beside rustc-<version>-<triple> in a release. build-rustc translates
+# between the two.
 #
-# The zstd step comes first: wasmer's binaries all link their build machine's
-# Homebrew libzstd and will not start until they are repointed at ours.
+# The zstd step comes first: on macOS wasmer's binaries all link their build
+# machine's Homebrew libzstd and will not start until they are repointed at
+# ours. On Linux they link the ordinary libzstd.so.1 that the build image
+# installs, so nothing is repointed there -- but the archive is built anyway,
+# because the toolchain build that follows links it statically.
 #
-# Runs on GitHub's macOS runners: free on a public repo, 10x-billed on a
+# Runs on GitHub's hosted runners: free on a public repo, 10x-billed on a
 # private one. Third-party actions are pinned to commit SHAs rather than tags,
-# so a repointed tag cannot change what executes here.
+# so a repointed tag cannot change what executes here. The Linux jobs go
+# through ./build-env, so the pruning happens in the same pinned image the
+# toolchain is later built in -- wasmer's llvm-config needs glibc 2.34 and
+# will not start on anything older.
 name: llvm
 
 on:
@@ -40,6 +47,10 @@ jobs:
             runner: macos-15
           - host: x86_64-apple-darwin
             runner: macos-15-intel
+          - host: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - host: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -52,15 +63,20 @@ jobs:
         env:
           NEED: "12"       # GB: 2.7 GB unpack plus the 768 MB kept
         run: |
-          avail=$(df -g . | tail -1 | awk '{print $4}')
+          # -k rather than -g: BSD df has no -g on Linux and GNU df has no -g
+          # at all. 1024-blocks are the one unit both agree on.
+          avail=$(df -k . | tail -1 | awk '{print int($4/1048576)}')
           echo "$avail GB free, need $NEED"
           [ "$avail" -ge "$NEED" ] || { echo "not enough disk"; exit 1; }
 
       - name: check host
         run: |
-          case "$(uname -m)/${{ matrix.host }}" in
-            arm64/aarch64-apple-darwin|x86_64/x86_64-apple-darwin) ;;
-            *) echo "runner is $(uname -m), job claims ${{ matrix.host }}"
+          case "$(uname -s)/$(uname -m)/${{ matrix.host }}" in
+            Darwin/arm64/aarch64-apple-darwin) ;;
+            Darwin/x86_64/x86_64-apple-darwin) ;;
+            Linux/aarch64/aarch64-unknown-linux-gnu) ;;
+            Linux/x86_64/x86_64-unknown-linux-gnu) ;;
+            *) echo "runner is $(uname -s)/$(uname -m), job claims ${{ matrix.host }}"
                exit 1 ;;
           esac
 
@@ -68,15 +84,15 @@ jobs:
       # and a hash. Must come before `llvm`: wasmer's tools are repointed at it,
       # and until they are, none of them start.
       - name: zstd
-        run: ./build-rustc zstd
+        run: ./build-env ./build-rustc zstd
 
       # build-rustc reads the host and picks wasmer's matching asset.
       - name: fetch and prune
         env:
           LLVM_RELEASE: ${{ inputs.release }}
-        run: ./build-rustc llvm
+        run: ./build-env ./build-rustc llvm
 
-      - run: ./build-rustc llvm-pack
+      - run: ./build-env ./build-rustc llvm-pack
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:

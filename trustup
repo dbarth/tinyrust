@@ -75,6 +75,30 @@ tilde() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;;
                        *)         printf '%s' "$1" ;; esac; }
 mb()   { du -sm "$@" 2>/dev/null | awk '{s+=$1} END {print s+0}'; }
 
+# The two places the platforms disagree on a shell command, and the one place
+# they disagree on how a binary names what it links. Everything else in this
+# file is the same on both.
+OS="$(uname -s)"
+fsize()  { case "$OS" in Darwin) stat -f%z "$1" ;; *) stat -c%s "$1" ;; esac; }
+sha256() { case "$OS" in
+             Darwin) shasum -a 256 "$1" | cut -d' ' -f1 ;;
+             *)      sha256sum "$1" | cut -d' ' -f1 ;;
+           esac; }
+# Mach-O records a path per dependency, ELF records a soname. Either way this
+# only has to answer whether librustc_driver is among them.
+bin_deps() {
+  case "$OS" in
+    Darwin) otool -L "$1" 2>/dev/null | tail -n +2 | awk '{print $1}' ;;
+    *)      readelf -d "$1" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' ;;
+  esac
+}
+is_object() {
+  case "$(file -b "$1" 2>/dev/null)" in
+    *Mach-O*|*ELF*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # The host triple, from the machine rather than from a guess. This is the whole
 # point: rustup ships one rustc that can emit for 330 targets, and exactly one
 # of them is ever used here.
@@ -112,29 +136,42 @@ SKIP=(
 # One field out of the channel manifest. The file is a TOML index of every
 # component for every target; the entries are regular enough that a parser
 # would be ceremony.
+#
+# awk, not python3. This is the installer, and it runs before anything is
+# installed -- on whatever the machine already has. macOS always has a
+# python3; debian:12-slim does not, and the install died at this line.
 manifest_field() {
   local pkg="$1" triple="$2" field="$3" mf="$4"
-  python3 - "$pkg" "$triple" "$field" "$mf" "$0" <<'PY'
-import re, sys
-pkg, triple, field, mf, me = sys.argv[1:6]
-s = open(mf, encoding="utf-8").read()
-head = f"[pkg.{pkg}.target.{triple}]"
-i = s.find(head)
-if i < 0:
-    sys.exit(f"trustup: {pkg} is not published for {triple}")
-body = s[i + len(head):]
-body = body[:body.find("\n[")]
-m = re.search(rf'{field} = "([^"]+)"', body)
-if not m:
-    # The entry exists but carries no artefact: the component is real, just not
-    # built for this target on this channel. cranelift, for one, is nightly.
-    if "available = false" in body:
-        sys.exit(f"trustup: {pkg} is not available for {triple} on this channel\n"
-                 f"  some components are nightly-only -- try:\n"
-                 f"  TRUSTUP_CHANNEL=nightly {me} install && {me} component add {pkg}")
-    sys.exit(f"trustup: no {field} for {pkg}/{triple}")
-print(m.group(1))
-PY
+  awk -v pkg="$pkg" -v triple="$triple" -v field="$field" -v me="$0" '
+    # The block for this component and this target, and nothing after it.
+    $0 == "[pkg." pkg ".target." triple "]" { inblock = 1; found = 1; next }
+    inblock && /^\[/ { inblock = 0 }
+    inblock {
+      if ($0 ~ "^" field " = \"") {
+        sub("^" field " = \"", ""); sub("\"$", "")
+        print; got = 1; exit
+      }
+      if ($0 ~ /^available = false/) unavailable = 1
+    }
+    END {
+      if (got) exit 0
+      if (!found) {
+        printf "trustup: %s is not published for %s\n", pkg, triple > "/dev/stderr"
+        exit 1
+      }
+      # The entry exists but carries no artefact: the component is real, just
+      # not built for this target on this channel. cranelift, for one, is
+      # nightly.
+      if (unavailable) {
+        printf "trustup: %s is not available for %s on this channel\n", pkg, triple > "/dev/stderr"
+        printf "  some components are nightly-only -- try:\n" > "/dev/stderr"
+        printf "  TRUSTUP_CHANNEL=nightly %s install && %s component add %s\n", me, me, pkg > "/dev/stderr"
+        exit 1
+      }
+      printf "trustup: no %s for %s/%s\n", field, pkg, triple > "/dev/stderr"
+      exit 1
+    }
+  ' "$mf"
 }
 
 # Tens of megabytes over a link of unknown speed: silence reads as a hang. A
@@ -157,6 +194,10 @@ mark() {
 # That is ~3 s, and it gets paid once whatever happens. Pay it here, where a
 # wait is expected and a line says what is going on, rather than on the first
 # bare `trustup` or the first `cargo build`, where it reads as a hang.
+#
+# Linux has no such check, so this costs a few milliseconds there. It stays
+# unconditional: running the two binaries once is a fair thing to do at the
+# end of an install whatever the reason.
 warm_rustc_cargo() {
   note "checking binaries"
   "$dest/bin/rustc" --version >/dev/null 2>&1 || true
@@ -174,7 +215,7 @@ download() {                              # download <label> <url> <out>
   fi
   curl -sSfL -o "$out" "$url" & pid=$!
   while kill -0 "$pid" 2>/dev/null; do
-    now=$(( $(stat -f%z "$out" 2>/dev/null || echo 0) / 1048576 ))
+    now=$(( $(fsize "$out" 2>/dev/null || echo 0) / 1048576 ))
     printf '\r%s %-22s %5s MB' "${SPIN:$((i % 4)):1}" "$label" "$now"
     i=$((i + 1)); sleep 0.2
   done
@@ -343,13 +384,13 @@ fetch_component() {
   # A -preview component ships as <thing>-<version>: llvm-tools-preview arrives
   # as llvm-tools-1.98.0. Strip whichever prefix is actually on the file.
   ver="${ver#"$pkg"-}"; ver="${ver#"${pkg%-preview}"-}"; ver="${ver%-"$triple"}"
-  local dlb; dlb="$(stat -f%z "$tarball")"
+  local dlb; dlb="$(fsize "$tarball")"
   DOWNLOADED_B=$(( DOWNLOADED_B + dlb ))
   local was; was="$(mb "$dest")"
 
   # Verified here rather than trusted: this is the one thing rustup does that
   # a plain download does not.
-  got="$(shasum -a 256 "$tarball" | cut -d' ' -f1)"
+  got="$(sha256 "$tarball")"
   [ "$got" = "$hash" ] || die "$pkg checksum mismatch
      expected $hash
      got      $got"
@@ -426,14 +467,20 @@ cmd_install_direct() {
     fetch_component "$pkg" "$triple" "$mf" "$dest" "$work" "$prune"
   done
 
-  # rust-objcopy lives in lib/rustlib/<triple>/bin and has an rpath of
-  # @loader_path/../lib, but libLLVM.dylib ships in the prefix's own lib. cargo
-  # calls it to strip release binaries, so without this it warns on every build.
-  local tb
+  # rust-objcopy lives in lib/rustlib/<triple>/bin and looks for its libraries
+  # one directory up, but they ship in the prefix's own lib. cargo calls it to
+  # strip release binaries, so without this it warns on every build.
+  #
+  # Linux has no rust-objcopy to fix: rustc only shells out to one on macOS, so
+  # that directory ships empty and the loop finds nothing to do.
+  local tb lib
   for tb in "$dest"/lib/rustlib/*/bin; do
     [ -d "$tb" ] || continue
     mkdir -p "$tb/../lib"
-    ln -sf ../../../libLLVM.dylib "$tb/../lib/libLLVM.dylib"
+    for lib in "$dest"/lib/libLLVM.dylib "$dest"/lib/libLLVM*.so*; do
+      [ -e "$lib" ] || continue
+      ln -sf "../../../$(basename "$lib")" "$tb/../lib/$(basename "$lib")"
+    done
   done
 
   printf '%s\n' "$CHANNEL" > "$dest/.trustup-channel"
@@ -496,8 +543,8 @@ upstream_is_independent() {
     # rlib or rmeta from another build is E0514 waiting to happen. It links
     # nothing, so otool would never see it.
     case "$f" in *.rlib|*.rmeta) bad="$bad $(basename "$f")"; continue ;; esac
-    case "$(file -b "$f" 2>/dev/null)" in *Mach-O*) ;; *) continue ;; esac
-    otool -L "$f" 2>/dev/null | grep -q 'librustc_driver' && bad="$bad $(basename "$f")"
+    is_object "$f" || continue
+    bin_deps "$f" | grep -q 'librustc_driver' && bad="$bad $(basename "$f")"
   done < <(comm -13 "$before" "$after")
   [ -z "$bad" ] && return 0
   die "$pkg is tied to the compiler that built it ($bad ) and that was not this one.
@@ -942,13 +989,22 @@ link_into_path() {
 
   local line=". \"\$HOME/.cargo/env\""
   write_cargo_env
-  local rc
+  # Only files that already exist, so this never invents somebody's shell
+  # configuration. A container image usually has none of them, though, and
+  # then the install would finish having put nothing on PATH -- so if none
+  # were found, write the one every POSIX shell reads.
+  local rc touched=0
   for rc in "$HOME/.zshenv" "$HOME/.bashrc" "$HOME/.profile"; do
     [ -e "$rc" ] || continue
+    touched=1
     grep -qF '.cargo/env' "$rc" 2>/dev/null && continue
     printf '\n%s\n' "$line" >> "$rc"
     note "added $CARGO_BIN to $(basename "$rc")"
   done
+  if [ "$touched" = 0 ]; then
+    printf '%s\n' "$line" >> "$HOME/.profile"
+    note "created .profile with $CARGO_BIN on PATH"
+  fi
 }
 
 cmd_component() {

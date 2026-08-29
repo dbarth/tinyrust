@@ -1,4 +1,4 @@
-# Build a tinyrust toolchain on macOS and attach it to a release.
+# Build a tinyrust toolchain and attach it to a release.
 #
 # Runs on GitHub's macOS runners: free on a public repo, 10x-billed on a
 # private one. Third-party actions are pinned to commit SHAs rather than tags,
@@ -23,11 +23,23 @@
 #   arch    one job per host, because rustc, cargo and the four optional tools
 #           are native binaries for the machine that built them. macos-15 is
 #           arm64 and macos-15-intel is x86_64; macos-13 is gone and macos-14
-#           is deprecated. Each job packs only its own rust-std -- that
-#           artifact is keyed by target and built once, by the host that owns
-#           it -- and `dist-merge` folds the two into the one manifest trustup
-#           fetches. Nothing in the installer chooses: trustup already picks by
-#           its own host triple.
+#           is deprecated. ubuntu-24.04-arm and ubuntu-latest are the two Linux
+#           hosts. Each job packs only its own rust-std -- that artifact is
+#           keyed by target and built once, by the host that owns it -- and
+#           `dist-merge` folds the four into the one manifest trustup fetches.
+#           Nothing in the installer chooses: trustup already picks by its own
+#           host triple.
+#   image   the Linux jobs build inside ./Dockerfile via ./build-env, and the
+#           macOS jobs run on the runner. That is not symmetry for its own
+#           sake: the glibc a binary is built against is the oldest system it
+#           will run on, so leaving it to the runner image would make the
+#           floor drift when GitHub updates one. macOS has no such knob --
+#           the SDK is the platform.
+#   memory  fat LTO links librustc_driver in one process against the whole of
+#           LLVM's static archives. It does not fit in 7 GB: a laptop VM that
+#           size is OOM-killed at exactly that step. The hosted runners have
+#           16 GB and no desktop competing for it, which is why this is built
+#           here and not locally.
 #   clean   checkout wipes untracked files, so a self-hosted run refetches
 #           rust/ each time. That is the price of not building on stale state;
 #           llvm/ comes back from the cache.
@@ -59,12 +71,11 @@ permissions:
 jobs:
   build:
     strategy:
-      # Let the other host finish rather than cancelling it, so one failure
-      # reports both results. It does not make the release partial: `publish`
-      # needs the whole matrix, and that is deliberate. Each host now owns one
-      # rust-std, so an arm-only release would carry no x86_64 std at all --
-      # worse for cross-compiling than what 0.1.0 shipped. Both hosts or
-      # neither.
+      # Let the other hosts finish rather than cancelling them, so one failure
+      # reports every result. It does not make the release partial: `publish`
+      # needs the whole matrix, and that is deliberate. Each host owns one
+      # rust-std, so a partial release would carry no std for the missing one
+      # -- worse for cross-compiling than shipping nothing. All hosts or none.
       fail-fast: false
       matrix:
         include:
@@ -72,6 +83,10 @@ jobs:
             runner: macos-15
           - host: x86_64-apple-darwin
             runner: macos-15-intel
+          - host: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - host: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     steps:
@@ -84,7 +99,9 @@ jobs:
         env:
           NEED: "25"       # GB: ~15 GB of intermediates, with room
         run: |
-          avail=$(df -g . | tail -1 | awk '{print $4}')
+          # -k rather than -g: BSD df has no -g on Linux and GNU df has no -g
+          # at all. 1024-blocks are the one unit both agree on.
+          avail=$(df -k . | tail -1 | awk '{print int($4/1048576)}')
           echo "$avail GB free, need $NEED"
           [ "$avail" -ge "$NEED" ] || { echo "not enough disk"; exit 1; }
 
@@ -92,18 +109,21 @@ jobs:
       # would otherwise build an arm64 toolchain and publish it as Intel.
       - name: check host
         run: |
-          case "$(uname -m)/${{ matrix.host }}" in
-            arm64/aarch64-apple-darwin|x86_64/x86_64-apple-darwin) ;;
-            *) echo "runner is $(uname -m), job claims ${{ matrix.host }}"
+          case "$(uname -s)/$(uname -m)/${{ matrix.host }}" in
+            Darwin/arm64/aarch64-apple-darwin) ;;
+            Darwin/x86_64/x86_64-apple-darwin) ;;
+            Linux/aarch64/aarch64-unknown-linux-gnu) ;;
+            Linux/x86_64/x86_64-unknown-linux-gnu) ;;
+            *) echo "runner is $(uname -s)/$(uname -m), job claims ${{ matrix.host }}"
                exit 1 ;;
           esac
-          echo "$(uname -m) is ${{ matrix.host }}"
+          echo "$(uname -s)/$(uname -m) is ${{ matrix.host }}"
 
       # The only library our binaries link, built here and pinned to a version
       # and a hash. Must come before `llvm`: wasmer's tools are repointed at it,
       # and until they are, none of them start.
       - name: zstd
-        run: ./build-rustc zstd
+        run: ./build-env ./build-rustc zstd
 
       # The pruned artifact from the llvm workflow: 115 MB, unpacking to 768 MB.
       # Without it this step is a 457 MB download and a 2.7 GB unpack. Keyed by
@@ -127,25 +147,29 @@ jobs:
         run: |
           gh release download llvm-22.x --repo "$GITHUB_REPOSITORY" \
             --pattern "$ASSET" --dir "$RUNNER_TEMP" --clobber
-          TINYRUST_LLVM_URL="file://$RUNNER_TEMP/$ASSET" ./build-rustc llvm
+          # Copied in rather than read from RUNNER_TEMP: build-env mounts the
+          # working tree and nothing else.
+          cp "$RUNNER_TEMP/$ASSET" "$ASSET"
+          TINYRUST_LLVM_URL="file://$PWD/$ASSET" ./build-env ./build-rustc llvm
+          rm -f "$ASSET"
 
       - name: fetch rust
-        run: ./build-rustc fetch
+        run: ./build-env ./build-rustc fetch
 
       - name: build
         env:
           RUSTC_LTO: fat       # dist refuses anything else
           RUSTC_STAGE: "2"
         run: |
-          ./build-rustc configure
-          ./build-rustc build
+          ./build-env ./build-rustc configure
+          ./build-env ./build-rustc build
 
       - name: trim, strip, verify
         env: { RUSTC_STAGE: "2" }
         run: |
-          ./build-rustc trim
-          ./build-rustc strip
-          ./build-rustc verify
+          ./build-env ./build-rustc trim
+          ./build-env ./build-rustc strip
+          ./build-env ./build-rustc verify
 
       # TARGETS defaults to this host's own target, so each job packs exactly
       # one rust-std and the two never collide in the release.
@@ -156,7 +180,7 @@ jobs:
           # Without this the manifest points at this runner's disk.
           TINYRUST_DIST_BASE: https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag || github.ref_name }}
         run: |
-          ./build-rustc dist
+          ./build-env ./build-rustc dist
           ls -l dist
 
       # The packages this job just built, installed and used the way a reader of
@@ -166,11 +190,21 @@ jobs:
       # repoints the manifest at the local copy, since its URLs are the release
       # ones and the release does not exist yet.
       - name: check
-        run: ./check --dist dist
+        run: ./build-env ./check --dist dist
+
+      # The other machine a Linux user might have: no compiler, no python3,
+      # an older glibc than the build image. The install has to work there and
+      # the build has to say why it cannot. Runs on the runner rather than
+      # through build-env, because it starts containers of its own.
+      - name: check on a bare machine
+        if: runner.os == 'Linux'
+        run: |
+          ./check --in debian:12-slim --dist dist
+          ./check --in rockylinux:9 --dist dist
 
       - name: measure
         env: { RUSTC_STAGE: "2" }
-        run: ./build-rustc measure || true
+        run: ./build-env ./build-rustc measure || true
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

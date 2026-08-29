@@ -5,6 +5,7 @@
 #   ./check                 install from ./dist, exercise it
 #   ./check --published     install the way the README says, from the release
 #   ./check --dist DIR      test a dist directory as built, before it is published
+#   ./check --in IMAGE      run the whole thing inside a container image
 #   ./check --keep          leave the sandbox behind to poke at
 #   ./check -o net          skip anything that needs the network
 #   ./check -o heavy        skip `go full`, which downloads 1.4 GB
@@ -24,9 +25,10 @@
 set -uo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DIST="local"; DISTDIR=""; KEEP=0; MATCH=""; OMIT=""
+DIST="local"; DISTDIR=""; KEEP=0; MATCH=""; OMIT=""; IMAGE=""
 while [ $# -gt 0 ]; do
   case "$1" in
+    --in)        shift; IMAGE="${1:-}" ;;
     --published) DIST=published ;;
     --local)     DIST=local ;;
     --dist)      shift; DIST=dir; DISTDIR="${1:-}" ;;
@@ -38,6 +40,72 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# ---- somebody else's machine ----------------------------------------------
+#
+# The point of --in is that the machine is not yours. A laptop that has built
+# this has a compiler, a linker, Xcode, half a toolchain -- and the one thing
+# the published tarball has to survive is a machine with none of that.
+#
+# curl and xz are the installer's own prerequisites and are fetched here when
+# the image lacks them, because testing that a container cannot download is
+# not testing tinyrust. A compiler is never installed: whether one is present
+# is exactly what the `cc` steps below are about.
+if [ -n "$IMAGE" ]; then
+  args=""
+  [ "$KEEP" = 1 ] && args="$args --keep"
+  [ -n "$MATCH" ] && args="$args -m $MATCH"
+  for o in $OMIT; do args="$args -o $o"; done
+  case "$DIST" in
+    published) args="$args --published" ;;
+    dir)  args="$args --dist /tinyrust/$(basename "$DISTDIR")" ;;
+    # --local means $SRC/dist, which is copied in under the same name.
+    local) ;;
+  esac
+  # Only what the check needs. A working copy of this repo also holds rust/,
+  # llvm/ and the release directories -- several GB that would be copied into
+  # the container before a single step ran.
+  case "$DIST" in
+    dir)   distsrc="$DISTDIR" ;;
+    local) distsrc="$SRC/dist" ;;
+    *)     distsrc="" ;;
+  esac
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/tinyrust-in.XXXXXX")"
+  cp "$SRC/check" "$SRC/trustup" "$SRC/install.sh" "$stage/"
+  [ -n "$distsrc" ] && [ -d "$distsrc" ] && cp -r "$distsrc" "$stage/$(basename "$distsrc")"
+  trap 'rm -rf "$stage"' EXIT
+  printf '\033[1m%s\033[0m\n' "check in $IMAGE"
+  exec docker run --rm -v "$stage:/src:ro" "$IMAGE" sh -c '
+    set -e
+    # Only what is actually missing. Rocky 9 ships curl-minimal, which
+    # provides the curl command and conflicts with the curl package, so
+    # asking for both is an error rather than a no-op.
+    have_curl=1; have_xz=1
+    command -v curl >/dev/null 2>&1 || have_curl=0
+    command -v xz   >/dev/null 2>&1 || have_xz=0
+    if [ "$have_curl" = 0 ] || [ "$have_xz" = 0 ]; then
+      if command -v apt-get >/dev/null 2>&1; then
+        pkgs="ca-certificates"
+        [ "$have_curl" = 0 ] && pkgs="$pkgs curl"
+        [ "$have_xz" = 0 ] && pkgs="$pkgs xz-utils"
+        apt-get update -qq >/dev/null
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+          $pkgs >/dev/null
+      else
+        pkgs=""
+        [ "$have_curl" = 0 ] && pkgs="$pkgs curl"
+        [ "$have_xz" = 0 ] && pkgs="$pkgs xz"
+        if command -v microdnf >/dev/null 2>&1; then microdnf -y install $pkgs >/dev/null
+        elif command -v dnf >/dev/null 2>&1; then dnf -y install $pkgs >/dev/null
+        elif command -v apk >/dev/null 2>&1; then apk add --quiet $pkgs
+        else echo "check: missing$pkgs and no package manager I know" >&2; exit 2
+        fi
+      fi
+    fi
+    command -v bash >/dev/null 2>&1 || { echo "check: this image has no bash" >&2; exit 2; }
+    cp -r /src /tinyrust && cd /tinyrust && exec bash ./check '"$args"'
+  '
+fi
 
 # ---- the harness ----------------------------------------------------------
 
@@ -119,8 +187,12 @@ case "$DIST" in
     [ -d "$DISTDIR" ] || { echo "check: no such dist: $DISTDIR" >&2; exit 2; }
     mkdir -p "$WORK/dist"
     cp "$DISTDIR"/*.tar.xz "$DISTDIR"/channel-rust-*.toml "$WORK/dist/"
-    sed -i "" "s|xz_url = \"[^\"]*/|xz_url = \"file://$WORK/dist/|" \
-      "$WORK"/dist/channel-rust-*.toml
+    # BSD sed wants the backup suffix as its own argument, GNU sed will not
+    # take one at all. Write to a new file instead of arguing with either.
+    for m in "$WORK"/dist/channel-rust-*.toml; do
+      sed "s|xz_url = \"[^\"]*/|xz_url = \"file://$WORK/dist/|" "$m" > "$m.new"
+      mv "$m.new" "$m"
+    done
     export TRUSTUP_DIST="$WORK/dist"
     ;;
 esac
@@ -128,7 +200,43 @@ esac
 # to leave one alone, and here there is none to leave alone.
 unset RUSTUP_HOME CARGO_HOME RUSTUP_TOOLCHAIN RUSTC CARGO 2>/dev/null || true
 
-say "tinyrust check  ($DIST dist, sandbox $WORK)"
+# ---- what this machine is -------------------------------------------------
+
+OS="$(uname -s)"
+case "$OS" in
+  Darwin) TRIPLES='aarch64-apple-darwin|x86_64-apple-darwin'
+          # The README claims 262 MB.
+          MAX_MB=300 ;;
+  *)      TRIPLES='aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu'
+          # Linux starts from a larger std and a larger LLVM, so the same
+          # build lands higher. Tighten this once a fat-LTO dist exists to
+          # measure against.
+          MAX_MB=330 ;;
+esac
+# A triple we do not publish, whatever host this is.
+UNPUBLISHED=riscv64gc-unknown-linux-gnu
+
+# The libraries a binary names -- a path on Mach-O, a soname on ELF -- and
+# what it is allowed to name. macOS answers with directories because the OS
+# ships one library; Linux answers with a list, because /usr/lib holds
+# whatever the distribution put there. Kept in step with build-rustc's own
+# copy: this is the same rule applied to the installed tree instead of the
+# built one.
+export OS
+export SYSTEM_LIBS="ld-linux-aarch64.so.1 ld-linux-x86-64.so.2 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 libgcc_s.so.1 libz.so.1"
+
+# rustc links through `cc`. A machine without one can install this toolchain
+# and cannot build with it, which is a documented prerequisite rather than a
+# bug -- so the steps that link are skipped there, and one step checks that
+# the failure says so.
+if command -v cc >/dev/null 2>&1; then
+  OMIT="$OMIT nocc"
+else
+  OMIT="$OMIT cc"
+fi
+
+say "tinyrust check  ($DIST dist, $OS, sandbox $WORK)"
+command -v cc >/dev/null 2>&1 || printf '  %s\n' "$(d 'no cc on this machine -- steps that link are skipped')"
 
 # ---- install --------------------------------------------------------------
 
@@ -175,60 +283,114 @@ it "reports a version" "" '
 it "shows info without crashing" "" '
   trustup info > info.out 2>&1
   contains info.out "rustc"
-  contains info.out "aarch64-apple-darwin|x86_64-apple-darwin"
+  contains info.out "$TRIPLES"
 '
 
 # `trim` is a separate step from `build`, so it is possible to package a tree
 # that still holds all 15 llvm-tools -- 208 MB of them, llc and opt alone being
 # 118 -- and nothing downstream notices. That shipped twice before this existed.
-it "keeps only the llvm-tool rustc shells out to" "" '
+# On macOS rustc shells out to rust-objcopy for -Cstrip, so exactly that one
+# binary earns its place. On Linux it shells out to nothing and the directory
+# ships empty -- the official Linux dist puts 13.8 MB there.
+it "ships only the llvm-tools something calls" "" '
   p="$HOME/.rustup/toolchains/tinyrust"
+  case "$OS" in Darwin) want="rust-objcopy " ;; *) want="" ;; esac
   for d in "$p"/lib/rustlib/*/bin; do
     [ -d "$d" ] || continue
     got="$(ls "$d" | tr "\n" " ")"
-    [ "$got" = "rust-objcopy " ] || { echo "$d holds: $got"; exit 1; }
+    [ "$got" = "$want" ] || { echo "$d holds: [$got], wanted [$want]"; exit 1; }
   done
 '
 
 it "installs in the size the README claims" "" '
   n=$(du -sm "$HOME/.rustup/toolchains/tinyrust" | awk "{print \$1}")
   echo "installed ${n} MB"
-  [ "$n" -le 300 ] || { echo "too big: ${n} MB -- README says 262"; exit 1; }
+  [ "$n" -le '"$MAX_MB"' ] || { echo "too big: ${n} MB -- ceiling is '"$MAX_MB"'"; exit 1; }
 '
 
 it "ships no binary that links outside the OS" "" '
   p="$HOME/.rustup/toolchains/tinyrust"
+  deps() { case "$OS" in
+             Darwin) otool -L "$1" 2>/dev/null | tail -n +2 | awk "{print \$1}" ;;
+             *) readelf -d "$1" 2>/dev/null | sed -n "s/.*(NEEDED).*\[\(.*\)\]/\1/p" ;;
+           esac; }
+  own() { case "$OS" in
+            Darwin) otool -D "$1" 2>/dev/null | tail -n +2 | head -1 ;;
+            *) readelf -d "$1" 2>/dev/null | sed -n "s/.*(SONAME).*\[\(.*\)\]/\1/p" ;;
+          esac; }
+  # Where a name that is not a system library is looked up. bin/rustc names
+  # librustc_driver by soname alone and finds it through RUNPATH in the
+  # toolchain own lib -- allowed, and the reason this cannot stop at the
+  # system list.
+  rpaths() { readelf -d "$1" 2>/dev/null \
+               | sed -n "s/.*R\(UN\)\?PATH.*\[\(.*\)\]/\2/p" | tr ":" "\n" \
+               | sed "s|[\$]ORIGIN|$(dirname "$1")|g"; }
   bad=0
   while IFS= read -r f; do
-    case "$(file -b "$f" 2>/dev/null)" in *Mach-O*) ;; *) continue ;; esac
-    id=""; case "$f" in *.dylib) id="$(otool -D "$f" | tail -n +2 | head -1)" ;; esac
+    case "$(file -b "$f" 2>/dev/null)" in *Mach-O*|*ELF*) ;; *) continue ;; esac
+    id="$(own "$f")"
     while IFS= read -r dep; do
       [ -n "$id" ] && [ "$dep" = "$id" ] && continue
-      case "$dep" in
-        /usr/lib/*|/System/*|"") continue ;;
-        @loader_path/*|@executable_path/*)
-          [ -e "$(dirname "$f")/${dep#@*path/}" ] && continue
-          echo "DANGLING $f -> $dep"; bad=1 ;;
-        @rpath/*) ;;
-        *) echo "LEAK $f -> $dep"; bad=1 ;;
-      esac
-    done < <(otool -L "$f" 2>/dev/null | tail -n +2 | awk "{print \$1}")
-  done < <(find "$p/bin" "$p/lib" -type f \( -perm -u+x -o -name "*.dylib" \) 2>/dev/null)
+      [ -z "$dep" ] && continue
+      if [ "$OS" = Darwin ]; then
+        case "$dep" in
+          /usr/lib/*|/System/*) continue ;;
+          @rpath/*) continue ;;
+          @loader_path/*|@executable_path/*)
+            [ -e "$(dirname "$f")/${dep#@*path/}" ] && continue
+            echo "DANGLING $f -> $dep"; bad=1; continue ;;
+        esac
+        echo "LEAK $f -> $dep"; bad=1
+      else
+        case " $SYSTEM_LIBS " in *" $dep "*) continue ;; esac
+        found=0
+        for rp in $(rpaths "$f"); do [ -e "$rp/$dep" ] && { found=1; break; }; done
+        [ "$found" = 1 ] && continue
+        echo "LEAK $f -> $dep"; bad=1
+      fi
+    done < <(deps "$f")
+  done < <(find "$p/bin" "$p/lib" -type f \
+            \( -perm -u+x -o -name "*.dylib" -o -name "*.so" -o -name "*.so.*" \) 2>/dev/null)
   [ "$bad" = 0 ]
+'
+
+# The Linux half of the same question, and the one a dependency list cannot
+# answer: the glibc a binary was built against lives in its symbols. A
+# toolchain that names only allowed libraries still will not start on a
+# machine older than its build image.
+it "needs no glibc newer than the floor" "" '
+  [ "$OS" = Darwin ] && exit 0
+  p="$HOME/.rustup/toolchains/tinyrust"
+  floor=""
+  while IFS= read -r f; do
+    case "$(file -b "$f" 2>/dev/null)" in *ELF*) ;; *) continue ;; esac
+    v="$(objdump -T "$f" 2>/dev/null | grep -o "GLIBC_[0-9][0-9.]*" | sed "s/GLIBC_//" | sort -uV | tail -1)"
+    [ -n "$v" ] || continue
+    floor="$(printf "%s\n%s\n" "$floor" "$v" | sort -uV | tail -1)"
+  done < <(find "$p/bin" "$p/lib" -type f \
+            \( -perm -u+x -o -name "*.so" -o -name "*.so.*" \) 2>/dev/null)
+  echo "oldest glibc that will run this: $floor"
+  [ "$(printf "%s\n%s\n" "$floor" "2.34" | sort -V | tail -1)" = "2.34" ] \
+    || { echo "needs glibc $floor, ceiling is 2.34"; exit 1; }
 '
 
 # ---- hello world ----------------------------------------------------------
 
 say "build something"
 
-it "creates and runs a new crate" "" '
+it "creates a new crate" "" '
   cargo new --quiet hello
+  exists hello/Cargo.toml
+  exists hello/src/main.rs
+'
+
+it "runs it" "cc" '
   cd hello
   cargo run --quiet > run.out 2>&1
   contains run.out "Hello, world!"
 '
 
-it "builds a release binary with strip = true" "" '
+it "builds a release binary with strip = true" "cc" '
   cd hello
   printf "\n[profile.release]\nstrip = true\n" >> Cargo.toml
   cargo build --release --quiet 2>&1 | tee strip.out
@@ -237,7 +399,7 @@ it "builds a release binary with strip = true" "" '
   ./target/release/hello | grep -q "Hello, world!"
 '
 
-it "runs unit tests" "" '
+it "runs unit tests" "cc" '
   cd hello
   cat >> src/main.rs <<EOF
 
@@ -251,7 +413,7 @@ EOF
   contains test.out "test result: ok"
 '
 
-it "runs doctests through rustdoc" "" '
+it "runs doctests through rustdoc" "cc" '
   cd hello
   cat > src/lib.rs <<EOF
 /// Adds two numbers.
@@ -271,7 +433,7 @@ it "builds documentation" "" '
   exists target/doc/hello/index.html
 '
 
-it "benchmarks with a harness-free bench target" "" '
+it "benchmarks with a harness-free bench target" "cc" '
   cd hello
   mkdir -p benches
   cat > benches/b.rs <<EOF
@@ -287,11 +449,21 @@ EOF
   contains bench.out "sum .* in "
 '
 
-it "adds a dependency from crates.io" "net" '
+it "adds a dependency from crates.io" "net,cc" '
   cd hello
   cargo add serde --quiet 2>&1 | tee add.out
   cargo build --quiet > dep.out 2>&1
   contains Cargo.toml "serde"
+'
+
+# The other side of the same fact: on a machine with no C toolchain the
+# toolchain installs, runs and refuses to link -- and has to say which of
+# those it is. Runs only where there is no cc, which is what --in is for.
+it "says what is missing when there is no linker" "nocc" '
+  cargo new --quiet nolink
+  cd nolink
+  cargo build > nolink.out 2>&1 && { echo "expected a failure"; exit 1; }
+  contains nolink.out "linker .?cc.? not found"
 '
 
 # ---- components -----------------------------------------------------------
@@ -348,7 +520,7 @@ it "removes a component again" "" '
   test ! -e "$HOME/.rustup/toolchains/tinyrust/bin/miri"
 '
 
-it "still builds after all that" "" '
+it "still builds after all that" "cc" '
   cd hello && cargo build --quiet > after.out 2>&1
   ./target/debug/hello | grep -q "Hello, world!"
 '
@@ -359,30 +531,56 @@ say "targets"
 
 it "lists the targets the dist offers" "" '
   rustup target list > tl.out 2>&1
-  contains tl.out "aarch64-apple-darwin|x86_64-apple-darwin"
+  contains tl.out "$TRIPLES"
 '
 
+# x86_64-unknown-linux-gnu used to be the example here, and once the Linux
+# hosts publish it, it is a target we carry. rust-std is keyed by target and
+# is interchangeable across hosts, so a Mac can install the Linux std -- and
+# then fail at link for want of a cross linker, which is what rustup does too.
+# The target that must still be refused is one nobody builds.
 it "refuses a target the dist does not carry" "" '
-  refuses rustup target add x86_64-unknown-linux-gnu
+  refuses rustup target add '"$UNPUBLISHED"'
   contains "$WORK/refused" "no rust-std|not published|does not"
 '
 
-# The interesting one. Until the Intel job has published, an aarch64 release
-# carries no x86_64 std, and the wrong answer is to quietly take the official
-# one -- it would be built by a different compiler and every crate would fail
-# with E0514. So this asserts whichever is true of the dist under test.
-it "cross-compiles, or says why it cannot" "" '
-  host="$(uname -m)"
-  other=x86_64-apple-darwin
-  [ "$host" = x86_64 ] && other=aarch64-apple-darwin
-  if rustup target add "$other" > ta.out 2>&1; then
-    cd hello && cargo build --quiet --target "$other" > cross.out 2>&1
-    exists "target/$other/debug/hello"
-    echo "cross-compiled to $other"
-  else
+# The interesting one. Until the other host has published, a release carries
+# no std for it, and the wrong answer is to quietly take the official one --
+# it would be built by a different compiler and every crate would fail with
+# E0514. So this asserts whichever is true of the dist under test.
+#
+# Whether the build then works is a second question, and the two platforms
+# answer it differently. Apple ships one universal SDK and linker, so cross
+# between the two Mac targets costs nothing. On Linux the linker is per
+# architecture and is not ours to ship, so `target add` succeeds -- the std is
+# real and interchangeable -- and the build needs a cross linker the machine
+# may not have. That is what stock rustup does too, so a missing cross linker
+# is reported, not failed.
+it "cross-compiles, or says why it cannot" "cc" '
+  case "$OS" in
+    Darwin) other=x86_64-apple-darwin
+            [ "$(uname -m)" = x86_64 ] && other=aarch64-apple-darwin
+            xcc="" ;;
+    *)      other=x86_64-unknown-linux-gnu; xcc=x86_64-linux-gnu-gcc
+            [ "$(uname -m)" = x86_64 ] && { other=aarch64-unknown-linux-gnu
+                                            xcc=aarch64-linux-gnu-gcc; } ;;
+  esac
+  if ! rustup target add "$other" > ta.out 2>&1; then
     contains ta.out "no rust-std for $other"
     echo "not published for $other yet, and it said so"
+    exit 0
   fi
+  exists "$HOME/.rustup/toolchains/tinyrust/lib/rustlib/$other/lib"
+  if [ -n "$xcc" ] && ! command -v "$xcc" >/dev/null 2>&1; then
+    echo "std for $other installed; no $xcc here, so not linking it"
+    exit 0
+  fi
+  cd hello
+  [ -n "$xcc" ] && { mkdir -p .cargo
+    printf "[target.%s]\nlinker = \"%s\"\n" "$other" "$xcc" > .cargo/config.toml; }
+  cargo build --quiet --target "$other" > cross.out 2>&1
+  exists "target/$other/debug/hello"
+  echo "cross-compiled to $other"
 '
 
 # ---- handing over to rustup ----------------------------------------------
@@ -394,7 +592,7 @@ it "fetches the real rustup on demand" "net,heavy" '
   contains tc.out "tinyrust"
 '
 
-it "survives a second install" "" '
+it "survives a second install" "cc" '
   if [ -n "${TRUSTUP_DIST:-}" ]; then
     TINYRUST_SOURCE='"$SRC"' TINYRUST_DIST="$TRUSTUP_DIST" \
       sh '"$SRC"'/install.sh > reinstall.out 2>&1

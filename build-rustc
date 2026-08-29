@@ -28,6 +28,162 @@ SRC="$HERE/rust"
 say()  { printf '\033[1m%s\033[0m\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
 die()  { printf 'build-rustc: %s\n' "$*" >&2; exit 1; }
+
+# ---- PLATFORM --------------------------------------------------------------
+#
+# Two object formats, one script. macOS is Mach-O -- otool, install_name_tool,
+# codesign, @loader_path. Linux is ELF -- readelf, patchelf, $ORIGIN. They
+# answer the same questions with different tools, so the questions are asked
+# here and the rest of the file never names either toolset.
+OS="$(uname -s)"
+
+# Is this a file whose link line is worth checking? An archive is never
+# loaded, so .a and .rlib are not.
+is_object() {
+  case "$(file -b "$1" 2>/dev/null)" in
+    *Mach-O*|*ELF*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The libraries a binary names, one per line, spelled the way its format
+# spells them: a path on Mach-O, a soname on ELF.
+bin_deps() {
+  case "$OS" in
+    Darwin) otool -L "$1" 2>/dev/null | tail -n +2 | awk '{print $1}' ;;
+    Linux)  readelf -d "$1" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' ;;
+  esac
+}
+
+# A library's own name. otool -L prints it first and it is not a dependency;
+# ELF calls it the SONAME. Either way it has to come out of the list before
+# anything walks it.
+bin_id() {
+  case "$OS" in
+    Darwin) otool -D "$1" 2>/dev/null | tail -n +2 | head -1 ;;
+    Linux)  readelf -d "$1" 2>/dev/null | sed -n 's/.*(SONAME).*\[\(.*\)\]/\1/p' ;;
+  esac
+}
+
+# The directories a relative dependency is looked up in -- LC_RPATH on Mach-O,
+# RUNPATH or RPATH on ELF -- with the "beside this file" token already turned
+# into a real directory, so the caller can just test whether the file is there.
+bin_rpaths() {
+  local f="$1" d; d="$(dirname "$f")"
+  case "$OS" in
+    Darwin) otool -l "$f" 2>/dev/null \
+              | awk '/LC_RPATH/{r=1} r && /^ *path /{print $2; r=0}' ;;
+    Linux)  readelf -d "$f" 2>/dev/null \
+              | sed -n 's/.*R\(UN\)\?PATH.*\[\(.*\)\]/\2/p' | tr ':' '\n' ;;
+  esac | sed "s|@loader_path|$d|g; s|@executable_path|$d|g; s|\\\$ORIGIN|$d|g"
+}
+
+# Name a library by its own soname, so a binary that links it records the
+# name rather than the path it happened to be built at.
+bin_setid() {
+  case "$OS" in
+    Darwin) install_name_tool -id "@rpath/$2" "$1" 2>/dev/null ;;
+    Linux)  patchelf --set-soname "$2" "$1" 2>/dev/null ;;
+  esac
+}
+
+# Point a binary at a copy of a library that travels beside it.
+# <file> <old dep> <dir relative to the file> <basename>
+bin_point() {
+  case "$OS" in
+    Darwin) install_name_tool -change "$2" "@loader_path/$3/$4" "$1" 2>/dev/null ;;
+    # ELF keeps the soname in NEEDED and finds it through RUNPATH, so the two
+    # halves are set separately. --force-rpath writes RPATH, which unlike
+    # RUNPATH also applies to what the library itself pulls in.
+    Linux)  patchelf --replace-needed "$2" "$4" "$1" 2>/dev/null
+            patchelf --force-rpath --set-rpath "\$ORIGIN/$3" "$1" 2>/dev/null ;;
+  esac
+}
+
+# Editing a Mach-O invalidates its signature, and unsigned Mach-O will not run
+# on arm64. ELF has nothing to re-sign.
+bin_sign() {
+  case "$OS" in Darwin) codesign -f -s - "$1" 2>/dev/null ;; esac
+}
+
+# Drop local symbols, keep the exported ones a dylib needs to stay loadable.
+# -x is the Mach-O spelling; --strip-unneeded is the ELF one, and it leaves
+# .dynsym alone for the same reason.
+bin_strip() {
+  case "$OS" in
+    Darwin) strip -x "$1" ;;
+    Linux)  strip --strip-unneeded "$1" ;;
+  esac
+}
+
+ncpu()   { case "$OS" in Darwin) sysctl -n hw.ncpu ;; Linux) nproc ;; esac; }
+fsize()  { case "$OS" in Darwin) stat -f%z "$1" ;; Linux) stat -c%s "$1" ;; esac; }
+sha256() { case "$OS" in
+             Darwin) shasum -a 256 "$1" | cut -d' ' -f1 ;;
+             Linux)  sha256sum "$1" | cut -d' ' -f1 ;;
+           esac; }
+
+# What a shipped binary is allowed to depend on.
+#
+# macOS answers with two directory prefixes, because the OS ships one library
+# and everything worth linking lives under it. Linux has no such directory --
+# /usr/lib holds whatever the distribution installed there -- so the allowance
+# is a list of sonames instead: the C runtime, the compiler runtime, and libz,
+# which cargo reaches through libgit2 and which every glibc system has.
+# Anything not on this list travels with the toolchain or is a leak.
+LINUX_SYSTEM_LIBS="ld-linux-aarch64.so.1 ld-linux-x86-64.so.2 libc.so.6 libm.so.6
+                   libdl.so.2 libpthread.so.0 librt.so.1 libgcc_s.so.1 libz.so.1"
+
+dep_is_system() {
+  case "$OS" in
+    Darwin) case "$1" in /usr/lib/*|/System/*|"") return 0 ;; esac ;;
+    Linux)  [ -z "$1" ] && return 0
+            case " $(printf '%s' "$LINUX_SYSTEM_LIBS" | tr -s ' \n' '  ') " in
+              *" $1 "*) return 0 ;;
+            esac ;;
+  esac
+  return 1
+}
+
+# Does this dependency resolve to a file that travels with the toolchain? Not
+# whether it is spelled like one -- a dangling @loader_path looks exactly like
+# a correctly bundled one until the binary is run.
+dep_resolves() { # <file> <dep>
+  local f="$1" dep="$2" rp
+  case "$dep" in
+    @loader_path/*|@executable_path/*)
+      [ -e "$(dirname "$f")/${dep#@*path/}" ] && return 0
+      return 1 ;;
+  esac
+  for rp in $(bin_rpaths "$f"); do
+    [ -e "$rp/${dep#@rpath/}" ] && return 0
+  done
+  return 1
+}
+
+# Where the library a dependency names actually is, so `bundle` can copy it.
+# Mach-O records a path and needs no lookup; ELF records a soname, and only
+# the loader knows what that resolves to.
+dep_path() { # <file> <dep>
+  case "$OS" in
+    Darwin) printf '%s' "$2" ;;
+    Linux)  ldd "$1" 2>/dev/null \
+              | awk -v n="$2" '$1 == n && $2 == "=>" { print $3; exit }' ;;
+  esac
+}
+
+# The oldest glibc a Linux binary will run against, which is decided by the
+# build image and is the Linux half of "does this run on a machine that is not
+# this one". Ubuntu 22.04 is the image and 2.35 is its glibc, but nothing on
+# the link line reaches past 2.34, so 2.34 is what we hold ourselves to --
+# RHEL 9 and Amazon Linux 2023 are worth the check. Raising this is a decision
+# about who can install, not a knob to quiet a failure.
+GLIBC_MAX="${TINYRUST_GLIBC_MAX:-2.34}"
+
+glibc_needed() {
+  objdump -T "$1" 2>/dev/null | grep -o 'GLIBC_[0-9][0-9.]*' \
+    | sed 's/GLIBC_//' | sort -uV | tail -1
+}
 # Every command except dist-merge builds or packages for a host. dist-merge
 # only concatenates manifests, and runs on whatever machine assembles the
 # release -- Linux in CI -- so the host is checked at dispatch, not at load.
@@ -48,6 +204,8 @@ host_triple() {
   case "$(uname -s)/$(uname -m)" in
     Darwin/arm64)  echo aarch64-apple-darwin ;;
     Darwin/x86_64) echo x86_64-apple-darwin ;;
+    Linux/aarch64) echo aarch64-unknown-linux-gnu ;;
+    Linux/x86_64)  echo x86_64-unknown-linux-gnu ;;
     # Empty rather than fatal, so dist-merge still runs here. need_host stops
     # everything else.
     *) echo "" ;;
@@ -79,7 +237,15 @@ STAGE="${RUSTC_STAGE:-1}"
 # iteration. Set RUSTC_LTO=fat for a release build.
 LTO="${RUSTC_LTO:-}"
 # Whether to install the llvm-tools component into the sysroot.
-LLVM_TOOLS="${RUSTC_LLVM_TOOLS:-true}"
+#
+# macOS needs exactly one of its 14 binaries: rustc shells out to rust-objcopy
+# to honour -Cstrip, so `cargo build --release` with `strip = true` fails
+# without it. Linux needs none. link.rs gates that call on is_like_darwin
+# (plus solaris and aix) and does the same job with linker flags everywhere
+# else, so the whole component is skipped and lib/rustlib/<triple>/bin ships
+# empty -- 13.8 MB in the official Linux dist, nothing here.
+case "$OS" in Darwin) llvm_tools_default=true ;; *) llvm_tools_default=false ;; esac
+LLVM_TOOLS="${RUSTC_LLVM_TOOLS:-$llvm_tools_default}"
 # Tools to build alongside the compiler. cargo is the only one that changes
 # what the toolchain can do -- without it there is no dependency resolution
 # and no build graph, only hand-compiled single files.
@@ -120,7 +286,7 @@ check_llvm() {
   [ -x "$LLVM/bin/llvm-config" ] || die "no llvm-config in $LLVM -- see NOTES.md"
   note "llvm     $("$LLVM/bin/llvm-config" --version)"
   note "targets  $("$LLVM/bin/llvm-config" --targets-built)$([ -f "$LLVM/bin/llvm-config.real" ] && echo "  (restricted from: $("$LLVM/bin/llvm-config.real" --targets-built))")"
-  note "static   $([ -z "$(find "$LLVM/lib" -name 'libLLVM*.dylib' 2>/dev/null)" ] && echo yes || echo 'no -- expected archives')"
+  note "static   $([ -z "$(find "$LLVM/lib" \( -name 'libLLVM*.dylib' -o -name 'libLLVM*.so*' \) 2>/dev/null)" ] && echo yes || echo 'no -- expected archives')"
   # llvm/ is not tracked (it is 604 MB of unpacked tarball), so the wrapper that
   # does the real work lives in the repo and is installed here. Idempotent:
   # llvm-config.real is only created once, from the original binary.
@@ -160,8 +326,10 @@ LLVM_RELEASE="${LLVM_RELEASE:-22.x}"
 # under the rust triple, because our artifacts sit beside rustc-$VERSION-$HOST
 # in the same release, and we spell wasmer's name only where we fetch theirs.
 case "$HOST" in
-  aarch64-apple-darwin) LLVM_WASMER_ASSET=llvm-darwin-aarch64.tar.xz ;;
-  x86_64-apple-darwin)  LLVM_WASMER_ASSET=llvm-darwin-amd64.tar.xz ;;
+  aarch64-apple-darwin)      LLVM_WASMER_ASSET=llvm-darwin-aarch64.tar.xz ;;
+  x86_64-apple-darwin)       LLVM_WASMER_ASSET=llvm-darwin-amd64.tar.xz ;;
+  aarch64-unknown-linux-gnu) LLVM_WASMER_ASSET=llvm-linux-aarch64.tar.xz ;;
+  x86_64-unknown-linux-gnu)  LLVM_WASMER_ASSET=llvm-linux-amd64.tar.xz ;;
   *) LLVM_WASMER_ASSET="" ;;
 esac
 LLVM_TARBALL="${LLVM_TARBALL:-$LLVM_WASMER_ASSET}"
@@ -202,6 +370,14 @@ ZSTD_LIB="$ZSTD/$HOST/lib"
 # machine's, so match on the library rather than on the path: the Intel build
 # names /usr/local, not /opt/homebrew.
 llvm_repoint_zstd() {
+  # Linux does not need this. wasmer's Linux binaries link the ordinary
+  # libzstd.so.1, which the build image installs, and none of them are shipped
+  # -- rustc only shells out to an llvm-tool on macOS, so the Linux toolchain
+  # carries none of them and there is nothing whose link line we inherit.
+  if [ "$OS" != Darwin ]; then
+    note "zstd     distro libzstd.so.1, build only -- nothing shipped links it"
+    return
+  fi
   [ -f "$ZSTD_LIB/libzstd.1.dylib" ] || die "no zstd for $HOST -- run '$0 zstd'"
   mkdir -p "$LLVM/lib"
   cp -f "$ZSTD_LIB/libzstd.1.dylib" "$LLVM/lib/libzstd.1.dylib"
@@ -240,7 +416,7 @@ cmd_llvm_pack() {
   say "packing $LLVM"
   ( cd "$(dirname "$LLVM")" && tar cf - "$(basename "$LLVM")" ) | xz -9 -T0 > "$out"
   ls -l "$out" | awk '{printf "  %.0f MB  %s\n", $5/1048576, $NF}'
-  shasum -a 256 "$out" | awk '{print "  sha256 "$1}'
+  printf '  sha256 %s\n' "$(sha256 "$out")"
 }
 
 cmd_llvm() {
@@ -323,11 +499,15 @@ cmd_zstd() {
     note "zstd already built for $HOST at $ZSTD_LIB -- --force to redo"
     return
   fi
-  local arch
-  case "$HOST" in
-    aarch64-*) arch=arm64 ;;
-    x86_64-*)  arch=x86_64 ;;
-    *) die "no clang -arch known for $HOST" ;;
+  # macOS clang is universal, so -arch builds either host natively and an Intel
+  # libzstd needs no Intel machine. Linux has no equivalent: gcc builds for the
+  # machine it is on, and the other host is built by the other runner.
+  local cc
+  case "$OS/$HOST" in
+    Darwin/aarch64-*) cc="clang -arch arm64" ;;
+    Darwin/x86_64-*)  cc="clang -arch x86_64" ;;
+    Linux/*)          cc="cc" ;;
+    *) die "no compiler known for $OS/$HOST" ;;
   esac
 
   local work; work="$(mktemp -d)"
@@ -336,7 +516,7 @@ cmd_zstd() {
   say "zstd $ZSTD_VERSION for $HOST"
   curl -sSfL --retry 3 -o "$work/zstd.tar.gz" "$ZSTD_URL" \
     || die "could not download $ZSTD_URL"
-  local got; got="$(shasum -a 256 "$work/zstd.tar.gz" | cut -d' ' -f1)"
+  local got; got="$(sha256 "$work/zstd.tar.gz")"
   if [ "$ZSTD_VERSION" = 1.5.7 ]; then
     [ "$got" = "$ZSTD_SHA256" ] || die "sha256 mismatch
   expected $ZSTD_SHA256
@@ -354,25 +534,33 @@ cmd_zstd() {
 
   # CC carries -arch so it reaches both the compile and the link. zstd's
   # Makefile owns CFLAGS, and overriding those would drop its own -O3.
-  say "building libzstd.a and libzstd.1.dylib ($arch)"
-  make -C "$src/lib" -j "$(sysctl -n hw.ncpu)" \
-    CC="clang -arch $arch" libzstd.a libzstd >/dev/null \
+  #
+  # The shared library is a macOS need only: it exists so `bundle` can put a
+  # copy beside rust-objcopy, and Linux ships no binary out of wasmer's LLVM.
+  local targets="libzstd.a"
+  [ "$OS" = Darwin ] && targets="libzstd.a libzstd"
+  say "building $targets for $HOST"
+  make -C "$src/lib" -j "$(ncpu)" CC="$cc" $targets >/dev/null \
     || die "zstd build failed"
 
   mkdir -p "$ZSTD_LIB"
   cp "$src/lib/libzstd.a" "$ZSTD_LIB/libzstd.a"
-  # The dylib ships under its versioned name and is referenced by the soname
-  # libzstd.1.dylib, which is what `bundle` will be looking for.
-  local dylib; dylib="$(find "$src/lib" -maxdepth 1 -name 'libzstd.*.dylib' -type f | head -1)"
-  [ -n "$dylib" ] || die "no dylib built in $src/lib"
-  cp "$dylib" "$ZSTD_LIB/libzstd.1.dylib"
-  install_name_tool -id "@rpath/libzstd.1.dylib" "$ZSTD_LIB/libzstd.1.dylib" 2>/dev/null
-  codesign -f -s - "$ZSTD_LIB/libzstd.1.dylib" 2>/dev/null
+  if [ "$OS" = Darwin ]; then
+    # The dylib ships under its versioned name and is referenced by the soname
+    # libzstd.1.dylib, which is what `bundle` will be looking for.
+    local dylib; dylib="$(find "$src/lib" -maxdepth 1 -name 'libzstd.*.dylib' -type f | head -1)"
+    [ -n "$dylib" ] || die "no dylib built in $src/lib"
+    cp "$dylib" "$ZSTD_LIB/libzstd.1.dylib"
+    bin_setid "$ZSTD_LIB/libzstd.1.dylib" libzstd.1.dylib
+    bin_sign "$ZSTD_LIB/libzstd.1.dylib"
+  fi
 
   local f
   for f in "$ZSTD_LIB"/libzstd.a "$ZSTD_LIB"/libzstd.1.dylib; do
+    [ -f "$f" ] || continue
     printf '  %-22s %6.1f MB  %s\n' "$(basename "$f")" \
-      "$(stat -f%z "$f" | awk '{print $1/1048576}')" "$(lipo -archs "$f" 2>/dev/null || echo '?')"
+      "$(fsize "$f" | awk '{print $1/1048576}')" \
+      "$(file -b "$f" | sed 's/,.*//')"
   done
   note "at $ZSTD_LIB"
 }
@@ -411,7 +599,17 @@ change-id = "ignore"
 # LLVM roots and never pulls ORC, CodeView, PDB or the object readers.
 link-shared = false
 # Do not fetch rust's own prebuilt LLVM -- we are supplying one.
-download-ci-llvm = false
+download-ci-llvm = false$([ "$OS" = Linux ] && cat <<'STDCPP'
+
+# The LLVM archives are C++, so without this librustc_driver needs whatever
+# libstdc++.so.6 the build image had -- a GLIBCXX floor on top of the glibc
+# one, and a library a minimal image may not carry. Linked statically it
+# needs neither, and the driver comes out wanting only libc, libm and
+# libgcc_s. It works through an external llvm-config, which is not obvious
+# and was measured.
+static-libstdcpp = true
+STDCPP
+)
 
 [build]
 target = [$(for t in $TARGETS; do printf '"%s", ' "$t"; done | sed 's/, $//')]
@@ -530,14 +728,14 @@ cmd_strip() {
   # rust-objcopy comes from ./llvm already stripped, so it is not listed.
   # stage<N>-tools-bin is where the optional tools live and where dist packs
   # them from, so they have to be stripped there too.
-  for f in "$out"/lib/librustc_driver-*.dylib "$out"/bin/* \
-           "$SRC/build/$HOST/stage$STAGE-tools-bin"/*; do
+  for f in "$out"/lib/librustc_driver-*.dylib "$out"/lib/librustc_driver-*.so \
+           "$out"/bin/* "$SRC/build/$HOST/stage$STAGE-tools-bin"/*; do
     [ -f "$f" ] || continue
-    before=$(stat -f%z "$f")
-    # -x removes local symbols and keeps exported ones, which is what a dylib
-    # needs to stay loadable.
-    strip -x "$f"
-    after=$(stat -f%z "$f")
+    before=$(fsize "$f")
+    # Local symbols go, exported ones stay -- a shared library needs those to
+    # remain loadable, on either format.
+    bin_strip "$f"
+    after=$(fsize "$f")
     awk -v b=$before -v a=$after -v n="$(basename "$f")" \
       'BEGIN{printf "  %-34s %7.1f -> %7.1f MB\n", n, b/1048576, a/1048576}'
   done
@@ -622,8 +820,8 @@ cmd_upstream_ok() {
       # Rule 2: anything linking the driver.
       local f
       while IFS= read -r f; do
-        case "$(file -b "$f" 2>/dev/null)" in *Mach-O*) ;; *) continue ;; esac
-        if otool -L "$f" 2>/dev/null | grep -q 'librustc_driver'; then
+        is_object "$f" || continue
+        if bin_deps "$f" | grep -q 'librustc_driver'; then
           bad="links librustc_driver ($(basename "$f"))"; break
         fi
       done < <(find "$work/x" -type f)
@@ -652,8 +850,13 @@ cmd_upstream_ok() {
 # already bitten twice -- zstd in librustc_driver, then OpenSSL in cargo -- so
 # it is checked rather than remembered.
 #
-# Allowed: /usr/lib and /System (the macOS ABI), and the @rpath/@loader_path/
-# @executable_path forms, which resolve inside the toolchain itself.
+# Allowed on macOS: /usr/lib and /System (the ABI), and the @rpath/
+# @loader_path/@executable_path forms, which resolve inside the toolchain.
+# Allowed on Linux: the sonames in LINUX_SYSTEM_LIBS, and anything RUNPATH
+# resolves inside the toolchain. Linux gets a second check the other does not
+# need -- the glibc a binary was built against is recorded in its symbols, not
+# in its dependency list, so a binary that names only allowed libraries can
+# still refuse to start on an older machine. See GLIBC_MAX.
 # ./llvm's binaries were built against Homebrew's zstd, so anything bootstrap
 # copies out of them (rust-objcopy, which rustc *requires* for -Cstrip and
 # which cargo triggers via `strip` in release profiles) carries a hard
@@ -728,7 +931,7 @@ cmd_dist() {
     done
     ( cd "$dist/.stage" && tar cf - "$stem" ) | xz -9 -T0 > "$dist/$stem.tar.xz"
     rm -rf "$dist/.stage"
-    local hash; hash="$(shasum -a 256 "$dist/$stem.tar.xz" | cut -d' ' -f1)"
+    local hash; hash="$(sha256 "$dist/$stem.tar.xz")"
     cat >> "$mf" <<TOML
 [pkg.$pkg.target.$tri]
 available = true
@@ -744,7 +947,7 @@ TOML
   # per-target binaries (rust-objcopy) that rustc shells out to.
   local rustc_files="bin/rustc bin/rustdoc lib/rustlib/$HOST/bin"
   local d
-  for d in "$out"/lib/*.dylib; do
+  for d in "$out"/lib/*.dylib "$out"/lib/*.so "$out"/lib/*.so.*; do
     [ -e "$d" ] && rustc_files="$rustc_files lib/$(basename "$d")"
   done
   pack rustc "$HOST" $rustc_files
@@ -878,47 +1081,47 @@ cmd_bundle() {
   local f dep libdir base src rel n=0
   libdir="$out/lib"
 
+  local id
   while IFS= read -r f; do
-    case "$(file -b "$f" 2>/dev/null)" in *Mach-O*) ;; *) continue ;; esac
+    is_object "$f" || continue
     rel="$(python3 -c 'import os,sys;print(os.path.relpath(sys.argv[1], sys.argv[2]))' \
             "$libdir" "$(dirname "$f")")"
+    id="$(bin_id "$f")"
     while IFS= read -r dep; do
-      case "$dep" in
-        /usr/lib/*|/System/*|"") continue ;;
-        # @rpath is resolved by the loading binary's LC_RPATH, which rust sets
-        # up for its own dylibs. verify checks those.
-        @rpath/*) continue ;;
-        # An @loader_path dep is only fine if it resolves. The wasmer tools
-        # arrive already repointed at ./llvm's own copy of libzstd (see
-        # llvm_repoint_zstd), and that path does not exist inside a toolchain:
-        # rust-objcopy lands in lib/rustlib/<triple>/bin, where ../lib is the
-        # rust-std directory. Left alone it fails to load, and `cargo build
-        # --release` with `strip = true` cannot run it.
-        @loader_path/*|@executable_path/*)
-          [ -e "$(dirname "$f")/${dep#@*path/}" ] && continue ;;
-      esac
+      [ -n "$id" ] && [ "$dep" = "$id" ] && continue
+      # Already fine: the OS carries it, or it resolves inside the toolchain.
+      # Resolving is checked rather than the spelling -- the wasmer tools
+      # arrive repointed at ./llvm's own libzstd (see llvm_repoint_zstd), and
+      # that path does not exist inside a toolchain: rust-objcopy lands in
+      # lib/rustlib/<triple>/bin, where ../lib is the rust-std directory. Left
+      # alone it fails to load, and `cargo build --release` with `strip = true`
+      # cannot run it.
+      dep_is_system "$dep" && continue
+      dep_resolves "$f" "$dep" && continue
       base="$(basename "$dep")"
       # wasmer's binaries name their own build machine's paths, and rust-objcopy
       # is one of them. Where the library is one we build, take ours: it is the
       # pinned version, it matches the host, and it is there even when that
       # path is not.
-      src="$dep"
+      src="$(dep_path "$f" "$dep")"
       [ -f "$ZSTD_LIB/$base" ] && src="$ZSTD_LIB/$base"
-      [ -f "$src" ] || { note "WARNING: $(basename "$f") wants missing $dep"; continue; }
+      [ -n "$src" ] && [ -f "$src" ] \
+        || { note "WARNING: $(basename "$f") wants missing $dep"; continue; }
       mkdir -p "$libdir"
       if [ ! -f "$libdir/$base" ]; then
         cp -L "$src" "$libdir/$base"
         chmod u+w "$libdir/$base"
-        install_name_tool -id "@rpath/$base" "$libdir/$base" 2>/dev/null
-        codesign -f -s - "$libdir/$base" 2>/dev/null
+        bin_setid "$libdir/$base" "$base"
+        bin_sign "$libdir/$base"
       fi
       chmod u+w "$f"
-      install_name_tool -change "$dep" "@loader_path/$rel/$base" "$f" 2>/dev/null
-      codesign -f -s - "$f" 2>/dev/null
-      note "bundled $base for $(basename "$f")$([ "$src" = "$dep" ] || echo "  (ours, not $(dirname "$dep"))")"
+      bin_point "$f" "$dep" "$rel" "$base"
+      bin_sign "$f"
+      note "bundled $base for $(basename "$f")$([ "$src" = "$dep" ] || echo "  (ours, not $(dirname "$src"))")"
       n=$((n + 1))
-    done < <(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}')
-  done < <(find "$out/bin" "$out/lib" -type f \( -perm -u+x -o -name '*.dylib' \) 2>/dev/null)
+    done < <(bin_deps "$f")
+  done < <(find "$out/bin" "$out/lib" -type f \
+            \( -perm -u+x -o -name '*.dylib' -o -name '*.so' -o -name '*.so.*' \) 2>/dev/null)
 
   if [ "$n" -eq 0 ]; then note "nothing needed bundling"; fi
 }
@@ -926,57 +1129,62 @@ cmd_bundle() {
 cmd_verify() {
   local out="$SRC/build/$HOST/stage$STAGE"
   [ -d "$out" ] || die "no stage$STAGE -- run '$0 build'"
-  local f dep bad=0 checked=0
+  local f dep id bad=0 checked=0 need floor=""
 
   while IFS= read -r f; do
-    # Mach-O only; rlibs are archives and are never linked as such.
-    case "$(file -b "$f" 2>/dev/null)" in
-      *Mach-O*) ;;
-      *) continue ;;
-    esac
+    # Loadable files only; an rlib is an archive and is never linked as one.
+    is_object "$f" || continue
     checked=$((checked + 1))
-    # For a dylib, otool -L opens with the library's own install name. It is
-    # not a dependency and nothing has to resolve it, so take it out before
-    # walking the list.
-    local id=""
-    case "$f" in *.dylib) id="$(otool -D "$f" 2>/dev/null | tail -n +2 | head -1)" ;; esac
-    # LC_RPATH entries, for resolving @rpath. @loader_path inside an rpath is
-    # relative to the binary that carries it.
-    local rpaths; rpaths="$(otool -l "$f" 2>/dev/null \
-      | awk '/LC_RPATH/{r=1} r && /^ *path /{print $2; r=0}')"
+    # A library's own name is not a dependency and nothing has to resolve it,
+    # so take it out before walking the list.
+    id="$(bin_id "$f")"
     while IFS= read -r dep; do
       [ -n "$id" ] && [ "$dep" = "$id" ] && continue
+      dep_is_system "$dep" && continue
+      if dep_resolves "$f" "$dep"; then continue; fi
+      # Spelled as though it travels with the toolchain, and does not: the
+      # failure mode that shipped twice. Anything else is a library off the
+      # build host that a user will not have.
+      # DANGLING means spelled as though it travels with the toolchain and
+      # does not -- the failure that shipped twice. On ELF nothing is spelled
+      # that way: a NEEDED entry either resolves through RUNPATH or it is a
+      # library off the build host, which is a leak by any name.
       case "$dep" in
-        /usr/lib/*|/System/*|"") continue ;;
-        @loader_path/*|@executable_path/*)
-          # Checking that it resolves, not just that it is spelled with an @.
-          # A dangling @loader_path looks exactly like a correctly bundled one
-          # until the binary is run, and this checked only the spelling until
-          # a repointed rust-objcopy shipped that could not load libzstd.
-          if [ -e "$(dirname "$f")/${dep#@*path/}" ]; then continue; fi
-          printf '  DANGLING  %-24s -> %s\n' "$(basename "$f")" "$dep"
-          bad=$((bad + 1)); continue ;;
-        @rpath/*)
-          local rp found=0
-          for rp in $rpaths; do
-            case "$rp" in @loader_path*) rp="$(dirname "$f")/${rp#@loader_path/}" ;; esac
-            [ -e "$rp/${dep#@rpath/}" ] && { found=1; break; }
-          done
-          [ "$found" = 1 ] && continue
-          printf '  DANGLING  %-24s -> %s\n' "$(basename "$f")" "$dep"
-          bad=$((bad + 1)); continue ;;
-        *)
-          printf '  LEAK      %-24s -> %s\n' "$(basename "$f")" "$dep"
-          bad=$((bad + 1)); continue ;;
+        @*) printf '  DANGLING  %-24s -> %s\n' "$(basename "$f")" "$dep" ;;
+        *)  printf '  LEAK      %-24s -> %s\n' "$(basename "$f")" "$dep" ;;
       esac
-    done < <(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}')
-  done < <(find "$out/bin" "$out/lib" -type f \( -perm -u+x -o -name '*.dylib' \) 2>/dev/null)
+      bad=$((bad + 1))
+    done < <(bin_deps "$f")
+
+    # The Linux half of the same question. A binary that resolves every
+    # library it names still will not start on a machine whose glibc is older
+    # than the one it was built against, and nothing in the dependency list
+    # says so -- the version is inside the symbols.
+    if [ "$OS" = Linux ]; then
+      need="$(glibc_needed "$f")"
+      [ -n "$need" ] || continue
+      case "$floor" in
+        "") floor="$need" ;;
+        *)  floor="$(printf '%s\n%s\n' "$floor" "$need" | sort -uV | tail -1)" ;;
+      esac
+      if [ "$(printf '%s\n%s\n' "$need" "$GLIBC_MAX" | sort -V | tail -1)" != "$GLIBC_MAX" ]; then
+        printf '  GLIBC     %-24s -> needs %s, ceiling is %s\n' \
+          "$(basename "$f")" "$need" "$GLIBC_MAX"
+        bad=$((bad + 1))
+      fi
+    fi
+  done < <(find "$out/bin" "$out/lib" -type f \
+            \( -perm -u+x -o -name '*.dylib' -o -name '*.so' -o -name '*.so.*' \) 2>/dev/null)
 
   if [ "$bad" -gt 0 ]; then
     die "$bad bad dependencie(s) across $checked binaries -- see above"
   fi
   say "every dependency resolves"
-  note "$checked Mach-O files, each one to /usr/lib, /System or inside the toolchain"
+  case "$OS" in
+    Darwin) note "$checked Mach-O files, each one to /usr/lib, /System or inside the toolchain" ;;
+    Linux)  note "$checked ELF files, each one to the C runtime or inside the toolchain"
+            note "oldest glibc that will run this: ${floor:-none required}, ceiling $GLIBC_MAX" ;;
+  esac
 }
 
 cmd_measure() {
@@ -987,7 +1195,7 @@ cmd_measure() {
   # zeroes, and skip every percentage that would divide by one.
   local have_stock=0; [ -d "$stock/lib" ] && have_stock=1
 
-  b() { local t=0 f; for f in "$@"; do [ -f "$f" ] && t=$((t+$(stat -f%z "$f"))); done
+  b() { local t=0 f; for f in "$@"; do [ -f "$f" ] && t=$((t+$(fsize "$f"))); done
         awk -v t=$t 'BEGIN{printf "%.1f", t/1048576}'; }
   k() { du -sk "$@" 2>/dev/null | awk '{t+=$1} END{print t+0}'; }
   # k() of a tree, minus the k() of each path after it.
@@ -1003,14 +1211,15 @@ cmd_measure() {
   say "stage$STAGE"; echo
 
   local o_drv s_drv s_llvm
-  o_drv=$(b "$out"/lib/librustc_driver-*.dylib)
-  s_drv=$(sb "$stock"/lib/librustc_driver-*.dylib)
-  s_llvm=$(sb "$stock"/lib/libLLVM.dylib)  # the rustlib copy is a symlink to this
+  o_drv=$(b "$out"/lib/librustc_driver-*.dylib "$out"/lib/librustc_driver-*.so)
+  s_drv=$(sb "$stock"/lib/librustc_driver-*.dylib "$stock"/lib/librustc_driver-*.so)
+  # The rustlib copy is a symlink to this one, so it is not counted twice.
+  s_llvm=$(sb "$stock"/lib/libLLVM.dylib "$stock"/lib/libLLVM*.so*)
 
   say "the compiler, and the LLVM inside it"
   printf '  %-30s %8s %11s\n' "" stock "this build"
   printf '  %-30s %8s %11s\n' "librustc_driver" "$s_drv" "$o_drv"
-  printf '  %-30s %8s %11s\n' "libLLVM.dylib" "$s_llvm" "-- static"
+  printf '  %-30s %8s %11s\n' "libLLVM (shared, stock only)" "$s_llvm" "-- static"
   local s_sum; s_sum=$([ "$have_stock" = 1 ] \
     && awk -v a=$s_drv -v b=$s_llvm 'BEGIN{printf "%.1f", a+b}' || printf -- '--')
   printf '  %-30s %8s %11s   %s\n' "" "$s_sum" "$o_drv" "$(pct "$s_sum" "$o_drv")"
@@ -1032,7 +1241,8 @@ cmd_measure() {
   # taking these out, since each tree has a different set of them.
   local s_ex="$stock/bin/cargo $stock/bin/rust-analyzer $stock/bin/rust-gdb
               $stock/bin/rust-gdbgui $stock/bin/rust-lldb $stock/libexec
-              $stock/share $stock/etc $stock/manifest.in"
+              $stock/share $stock/etc $stock/manifest.in
+              $stock/lib/rustlib/$HOST/bin"
   local o_ex="$out/bin/rustdoc"
 
   say "like for like -- rustc and std only"
@@ -1052,7 +1262,8 @@ cmd_measure() {
 
   say "backends linked in"
   note "target-list still names $("$out/bin/rustc" --print target-list | wc -l | tr -d ' ') targets -- those specs are unconditional"
-  for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu \
+  for t in aarch64-apple-darwin x86_64-apple-darwin \
+           aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu \
            riscv64gc-unknown-linux-gnu wasm32-unknown-unknown armv7-unknown-linux-gnueabihf; do
     if "$out/bin/rustc" --print target-cpus --target "$t" >/dev/null 2>&1; then
       printf '  %-34s can emit%s\n' "$t" \
