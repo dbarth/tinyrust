@@ -470,6 +470,11 @@ it "says what is missing when there is no linker" "nocc" '
 
 say "components"
 
+# Not every dist carries rustc-alt. Not piped: grep -q exits early and pipefail
+# reads the producer's SIGPIPE as failure.
+( cd "$WORK" && rustup component list ) > "$WORK/offer.out" 2>&1
+grep -q '^ *rustc-alt' "$WORK/offer.out" || OMIT="$OMIT alt"
+
 it "lists components, installed and on offer" "" '
   rustup component list > cl.out 2>&1
   contains cl.out "clippy-preview"
@@ -518,6 +523,21 @@ it "adds rust-src from the official dist" "net" '
 it "removes a component again" "" '
   rustup component remove miri > rm.out 2>&1
   test ! -e "$HOME/.rustup/toolchains/tinyrust/bin/miri"
+'
+
+# rustc-alt replaces rustc's driver instead of adding a file, so the check is
+# that the file changes size, the toolchain still builds, and remove puts the
+# original back.
+it "swaps the driver for rustc-alt and back" "cc,alt" '
+  for f in "$HOME"/.rustup/toolchains/tinyrust/lib/librustc_driver-*; do d="$f"; done
+  before=$(wc -c < "$d")
+  rustup component add rustc-alt > alt-add.out 2>&1
+  test "$(wc -c < "$d")" -gt "$before"
+  cd hello && cargo build --quiet > alt-build.out 2>&1
+  ./target/debug/hello | grep -q "Hello, world!"
+  cd "$WORK"
+  rustup component remove rustc-alt > alt-rm.out 2>&1
+  test "$(wc -c < "$d")" -eq "$before"
 '
 
 it "still builds after all that" "cc" '
