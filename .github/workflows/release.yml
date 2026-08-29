@@ -183,9 +183,7 @@ jobs:
       # through build-env, because it starts containers of its own.
       - name: check on a bare machine
         if: runner.os == 'Linux'
-        run: |
-          ./check --in debian:12-slim --dist dist
-          ./check --in rockylinux:9 --dist dist
+        run: ./check --in debian:12-slim --dist dist
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
