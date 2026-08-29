@@ -25,6 +25,7 @@ SRC="$HERE/llvm-src"
 BLD="$HERE/llvm-build/$BUILD_TYPE"
 # Not under $BLD: llvm-config found inside a build tree reports build-tree paths.
 STAGE="$HERE/llvm-stage/$BUILD_TYPE"
+# No suffix is -O3 and builds rustc-alt; -minsizerel builds the default rustc.
 SUFFIX=""; [ "$BUILD_TYPE" = Release ] || SUFFIX="-$(echo "$BUILD_TYPE" | tr 'A-Z' 'a-z')"
 ASSET="$HERE/dist-llvm/tinyrust-llvm-$VERSION-$HOST$SUFFIX.tar.xz"
 

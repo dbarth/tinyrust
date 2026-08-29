@@ -229,6 +229,8 @@ download() {                              # download <label> <url> <out>
 pkg_mb() {                                # pkg_mb <prefix> <record>
   local p="$1" rec="$2"
   local list="$p/.trustup-files/$rec"
+  # A component that replaced a file carries its delta here, not a file list.
+  if [ -f "$list.mb" ]; then cat "$list.mb"; return 0; fi
   [ -f "$list" ] || return 1
   # du, not stat: everything else here is measured in blocks, and mixing the
   # two left the rows short of the total by a couple of percent across thirty
@@ -1046,6 +1048,21 @@ cmd_component() {
       [ -f "$p/.trustup-files/$pkg" ] || [ ! -f "$p/.trustup-files/$pkg-preview" ] \
         || pkg="$pkg-preview"
       case "$pkg" in
+        rustc-alt)
+          # It replaced rustc's driver, so undoing it means re-fetching rustc.
+          local w; w="$(mktemp -d)"
+          local ch; ch="$(cat "$p/.trustup-channel" 2>/dev/null || echo "$CHANNEL")"
+          curl -sSfL -o "$w/channel.toml" "$DIST/channel-rust-$ch.toml" \
+            || die "could not fetch the $ch manifest"
+          FROM="$ch" fetch_component rustc "$triple" "$w/channel.toml" "$p" "$w" no
+          rm -rf "$w"
+          rm -f "$p/.trustup-files/rustc-alt" "$p/.trustup-files/rustc-alt.mb"
+          if [ -f "$p/.trustup-components" ]; then
+            grep -vxF rustc-alt "$p/.trustup-components" > "$p/.trustup-components.keep" || true
+            mv "$p/.trustup-components.keep" "$p/.trustup-components"
+          fi
+          note "rustc-alt removed, the default driver is back"
+          continue ;;
         rustc|rust-std|cargo)
           die "$pkg is the toolchain, not an addition to it.
        Removing it leaves something that cannot compile; delete
@@ -1082,6 +1099,10 @@ cmd_component() {
   local ok; ok=" $(sed -n 's/^upstream-ok = \[\(.*\)\]/\1/p' "$mf" \
                    | tr -d '"' | tr ',' ' ') "
   local omf="" pkg
+  local drv_was=0 dfile
+  for dfile in "$p"/lib/librustc_driver-*; do
+    [ -e "$dfile" ] && drv_was="$(fsize "$dfile")"
+  done
   say "adding to $(tilde "$p")"
   for pkg in "$@"; do
     # rustup takes the short name and resolves it; the manifest publishes these
@@ -1133,6 +1154,18 @@ cmd_component() {
   # install-time linking happened before this component existed.
   link_into_path "$p"
   say "now: $(mb "$p") MB"
+  # rustc-alt owns no file of its own; record what the driver swap added.
+  for pkg in "$@"; do
+    [ "$pkg" = rustc-alt ] || continue
+    : > "$p/.trustup-files/rustc-alt"
+    local drv_now="$drv_was"
+    for dfile in "$p"/lib/librustc_driver-*; do
+      [ -e "$dfile" ] && drv_now="$(fsize "$dfile")"
+    done
+    printf '%s' "$(( (drv_now - drv_was + 524288) / 1048576 ))" \
+      > "$p/.trustup-files/rustc-alt.mb"
+  done
+
 }
 
 # ---- looking at it ---------------------------------------------------------

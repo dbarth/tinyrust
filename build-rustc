@@ -13,6 +13,7 @@
 #   build-rustc trim       drop the llvm-tools nothing calls
 #   build-rustc bundle     pull non-system libs into the toolchain, repoint, re-sign
 #   build-rustc verify     fail if any binary links outside /usr/lib and /System
+#   build-rustc dist-alt   pack alt/librustc_driver-* as rustc-alt into ./dist
 #   build-rustc dist       package components + manifest for trustup to install
 #   build-rustc dist-merge OUT IN...  one manifest covering both hosts
 #   build-rustc upstream-ok  sweep the official dist for what is safe to reuse
@@ -1011,6 +1012,51 @@ TOML
   note "host $HOST -- merge with the other host's dist before publishing"
 }
 
+
+# Packs alt/librustc_driver-*, built against the -O3 LLVM, into an existing dist.
+cmd_dist_alt() {
+  local dist="$HERE/dist" chan="${TINYRUST_CHANNEL:-tinyrust}"
+  local mf="$dist/channel-rust-$chan.toml"
+  [ -f "$mf" ] || die "no dist to add to -- run '$0 dist' first"
+  local drv="" f
+  for f in "$HERE"/alt/librustc_driver-*; do [ -e "$f" ] && { drv="$f"; break; }; done
+  [ -n "$drv" ] || die "no driver in $HERE/alt"
+
+  # Smaller than the shipped one means it was built against the wrong LLVM.
+  local shipped="$dist/rustc-$VERSION-$HOST.tar.xz"
+  [ -f "$shipped" ] || die "no rustc component for $HOST in $dist"
+  local a b
+  a="$(fsize "$drv")"
+  b="$(tar -tvf "$shipped" | awk '/librustc_driver/ { print $5; exit }')"
+  [ -n "$b" ] || die "no driver inside $shipped"
+  [ "$a" -gt "$b" ] || die \
+    "alt driver is $a bytes against the shipped $b -- it should be the larger.
+Likely the two were built against the same LLVM: the unsuffixed artifact is
+-O3 and builds this one, -minsizerel builds the default."
+  if grep -q '^\[pkg.rustc-alt' "$mf"; then die "rustc-alt already in $mf"; fi
+
+  local stem="rustc-alt-$VERSION-$HOST"
+  local stage="$dist/.stage/$stem/rustc-alt/lib"
+  rm -rf "$dist/.stage"; mkdir -p "$stage"
+  cp "$drv" "$stage/"
+  local filter=""
+  case "$HOST" in aarch64-*) filter="--arm64" ;; x86_64-*) filter="--x86" ;; esac
+  ( cd "$dist/.stage" && tar cf - "$stem" ) \
+    | xz -T0 $filter --lzma2=preset=9 > "$dist/$stem.tar.xz"
+  rm -rf "$dist/.stage"
+
+  local base="${TINYRUST_DIST_BASE:-file://$dist}"
+  local hash; hash="$(sha256 "$dist/$stem.tar.xz")"
+  cat >> "$mf" <<TOML
+[pkg.rustc-alt.target.$HOST]
+available = true
+xz_url = "$base/$stem.tar.xz"
+xz_hash = "$hash"
+
+TOML
+  ls -l "$dist/$stem.tar.xz" | awk '{printf "  %-34s %6.1f MB\n", "rustc-alt '"$HOST"'", $5/1048576}'
+}
+
 # One channel manifest covers every host and every target, which is how the
 # official dist works: a single channel-rust-stable.toml holds 33 hosts' rustc
 # entries beside 117 targets' rust-std entries, and rustup picks by its own
@@ -1301,6 +1347,7 @@ case "${1:-}" in
   trim)      cmd_trim ;;
   bundle)    cmd_bundle ;;
   dist)      cmd_dist ;;
+  dist-alt)  cmd_dist_alt ;;
   dist-merge) shift; cmd_dist_merge "$@" ;;
   upstream-ok) cmd_upstream_ok ;;
   verify)    cmd_verify ;;

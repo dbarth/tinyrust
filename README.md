@@ -80,6 +80,7 @@ Other parts of the toolchain you can add with `rustup component add`:
 | `miri` | the interpreter, for UB in unsafe code |
 | `rust-src` | std sources, for IDEs and `-Zbuild-std` |
 | `llvm-tools-preview` | `llvm-cov` and friends, for coverage |
+| `rustc-alt` | compiler built for speed over size: +10 MB, release builds ~10% faster |
 
 `rustup component list` shows what is installed and what else is on offer.
 
