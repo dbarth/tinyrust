@@ -929,7 +929,18 @@ cmd_dist() {
       mkdir -p "$stage/$(dirname "$f")"
       cp -R "$from/$f" "$stage/$(dirname "$f")/"
     done
-    ( cd "$dist/.stage" && tar cf - "$stem" ) | xz -9 -T0 > "$dist/$stem.tar.xz"
+    # Branch filter: relative call targets rewritten to absolute before LZMA.
+    # 11.1% off rustc, 8.7% off cargo, nothing to decode. Per component, since
+    # rust-std is .rmeta and bitcode rather than machine code and comes out
+    # 3.6% bigger filtered. --arm64 needs xz 5.4 to unpack.
+    local filter=""
+    case "$pkg/$HOST" in
+      rust-std/*)  filter="" ;;
+      */aarch64-*) filter="--arm64" ;;
+      */x86_64-*)  filter="--x86" ;;
+    esac
+    ( cd "$dist/.stage" && tar cf - "$stem" ) \
+      | xz -T0 $filter --lzma2=preset=9 > "$dist/$stem.tar.xz"
     rm -rf "$dist/.stage"
     local hash; hash="$(sha256 "$dist/$stem.tar.xz")"
     cat >> "$mf" <<TOML
