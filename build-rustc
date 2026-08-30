@@ -1044,8 +1044,13 @@ cmd_dist_alt() {
   [ -f "$shipped" ] || die "no rustc component for $HOST in $dist"
   local a b
   a="$(fsize "$drv")"
-  b="$(tar -tvf "$shipped" | awk '/librustc_driver/ { print $5; exit }')"
-  [ -n "$b" ] || die "no driver inside $shipped"
+  # By name then by bytes: BSD and GNU tar put the size in different columns
+  # of -tv, and reading the wrong one compares against a clock time.
+  local names member
+  names="$(tar -tf "$shipped")"
+  member="$(printf '%s\n' "$names" | awk '/librustc_driver/ && !f { print; f=1 }')"
+  [ -n "$member" ] || die "no driver inside $shipped"
+  b="$(tar -xOf "$shipped" "$member" | wc -c | tr -d ' ')"
   [ "$a" -gt "$b" ] || die \
     "alt driver is $a bytes against the shipped $b -- it should be the larger.
 Likely the two were built against the same LLVM: the unsuffixed artifact is
