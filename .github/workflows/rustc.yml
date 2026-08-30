@@ -138,7 +138,7 @@ jobs:
           RUSTC_LTO: fat
           RUSTC_STAGE: "2"
           # Without this the manifest points at this runner's disk.
-          TINYRUST_DIST_BASE: https://github.com/${{ github.repository }}/releases/download/tiny-rustc-1.98.0-llvm-22.1.8
+          TINYRUST_DIST_BASE: https://github.com/${{ github.repository }}/releases/download/tinyrust-rustc-1.98.0-llvm-22.1.8
         run: |
           ./build-env ./build-rustc dist
           ls -l dist
@@ -153,7 +153,7 @@ jobs:
         env:
           RUSTC_LTO: fat
           RUSTC_STAGE: "2"
-          TINYRUST_DIST_BASE: https://github.com/${{ github.repository }}/releases/download/tiny-rustc-1.98.0-llvm-22.1.8
+          TINYRUST_DIST_BASE: https://github.com/${{ github.repository }}/releases/download/tinyrust-rustc-1.98.0-llvm-22.1.8
         run: |
           TINYRUST_LLVM_URL="file://$PWD/tinyrust-llvm-$LLVM_VERSION-${{ matrix.host }}.tar.xz" \
             ./build-env ./build-rustc llvm --force
@@ -186,11 +186,11 @@ jobs:
       - name: pack
         run: |
           mkdir -p out
-          tar cf out/tiny-rustc-$RUST_VERSION-${{ matrix.host }}.tar -C dist .
+          tar cf out/tinyrust-rustc-$RUST_VERSION-${{ matrix.host }}.tar -C dist .
           ls -l out
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          tag_name: tiny-rustc-1.98.0-llvm-22.1.8
+          tag_name: tinyrust-rustc-1.98.0-llvm-22.1.8
           files: out/*
           fail_on_unmatched_files: true

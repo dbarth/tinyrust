@@ -8,7 +8,7 @@
 name: release
 
 env:
-  RUSTC_TAG: "tiny-rustc-1.98.0-llvm-22.1.8"
+  RUSTC_TAG: "tinyrust-rustc-1.98.0-llvm-22.1.8"
 
 on:
   workflow_dispatch:
