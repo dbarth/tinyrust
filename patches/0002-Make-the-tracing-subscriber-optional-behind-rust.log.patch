@@ -1,0 +1,407 @@
+From 868158b36d03fdb56200c9bd370051bca9f21769 Mon Sep 17 00:00:00 2001
+From: David Barth <dbarth4@gmail.com>
+Date: Sun, 30 Aug 2026 13:44:08 +0200
+Subject: [PATCH] Make the tracing subscriber optional, behind `rust.logging`
+
+`rustc_log` links `tracing-subscriber` (with `EnvFilter`) and `tracing-tree`
+into every rustc, because `init_rustc_env_logger` runs at startup. For a
+compiler nobody is going to run under `RUSTC_LOG` that is dead weight.
+
+Put the gate in `rustc_log` itself rather than in `rustc_driver_impl`. A new
+`subscriber` feature, on by default, carries `tracing-subscriber` and
+`tracing-tree`; without it `init_logger` becomes a stub that warns when a
+filter was actually requested. Everything else the crate offers stays:
+`LoggerConfig`, `Error`, and the `tracing` / `tracing_core` re-exports that
+rustdoc, miri, the error index generator and the cranelift and gcc backends
+compile against. So none of those tools need a change, and `extern crate
+rustc_log` keeps resolving in the sysroot either way.
+
+Gating in `rustc_driver_impl` instead does not work: with `rustc_log` out of
+the graph it is not built at all, and tools that name it fail with E0463.
+Putting it back as a standalone sysroot rlib fails at link time too, because
+the sysroot only carries `.rmeta` for third-party crates, not `.rlib`.
+
+`rustc_driver_impl::init_logger_with_additional_layer` is the one item that
+must be cfg'd out: its bound names `rustc_log::BuildSubscriberRet`, which is
+defined in terms of `tracing_subscriber`. Its only in-tree caller is miri,
+behind miri's own non-default `tracing` feature.
+
+The `logging` feature is on by default at each link of the chain
+(`rustc-main` -> `rustc_driver` -> `rustc_driver_impl` -> `rustc_log`), so an
+unconfigured cargo build is unchanged. Bootstrap gains `rust.logging`
+(default true) and passes `--no-default-features` when it is false, following
+`rust.debug-logging` / `max_level_info`. The two are complementary:
+`debug-logging` decides which `debug!`/`trace!` call sites are compiled,
+`logging` decides whether anything is listening.
+
+Measured on a stage1 `librustc_driver` for aarch64-apple-darwin, `strip -x`ed:
+111,360,864 -> 110,703,864 bytes with `rust.logging = false`, -657,000. With
+it left at the default the binary is unchanged (-8 bytes of build hash).
+
+`x build compiler rustdoc clippy miri error_index_generator` and
+`x check compiler` were run in both configurations.
+---
+ bootstrap.example.toml                        |  8 +++++
+ compiler/rustc/Cargo.toml                     |  6 ++--
+ compiler/rustc_driver/Cargo.toml              |  8 ++++-
+ compiler/rustc_driver_impl/Cargo.toml         |  4 ++-
+ compiler/rustc_driver_impl/src/lib.rs         |  4 +++
+ compiler/rustc_log/Cargo.toml                 |  9 +++--
+ compiler/rustc_log/src/lib.rs                 | 36 ++++++++++++++++++-
+ src/bootstrap/src/core/build_steps/compile.rs |  6 ++++
+ src/bootstrap/src/core/config/config.rs       |  3 ++
+ src/bootstrap/src/core/config/toml/rust.rs    |  3 ++
+ src/bootstrap/src/utils/change_tracker.rs     |  5 +++
+ 11 files changed, 85 insertions(+), 7 deletions(-)
+
+diff --git a/bootstrap.example.toml b/bootstrap.example.toml
+index 1ca4bc91..74a0c86f 100644
+--- a/bootstrap.example.toml
++++ b/bootstrap.example.toml
+@@ -658,6 +658,14 @@
+ # are disabled statically" because `max_level_info` is enabled, set this value to `true`.
+ #rust.debug-logging = rust.debug-assertions (boolean)
+ 
++# Whether to link a tracing subscriber into the compiler at all.
++#
++# With this off, `rustc_log` is built without `tracing-subscriber` and `tracing-tree`, `RUSTC_LOG`
++# has no effect (rustc warns if it is set), and `librustc_driver` is a few hundred KB smaller.
++# `rust.debug-logging` is about which `debug!`/`trace!` call sites survive compilation; this is
++# about whether anything is listening.
++#rust.logging = true
++
+ # Whether or not to build rustc, tools and the libraries with randomized type layout
+ #rust.randomize-layout = false
+ 
+diff --git a/compiler/rustc/Cargo.toml b/compiler/rustc/Cargo.toml
+index 8cef9e06..fbf60f65 100644
+--- a/compiler/rustc/Cargo.toml
++++ b/compiler/rustc/Cargo.toml
+@@ -10,8 +10,8 @@ edition = "2024"
+ # crate is intended to be used by codegen backends, which may not be in-tree.
+ rustc_codegen_ssa = { path = "../rustc_codegen_ssa" }
+ 
+-rustc_driver = { path = "../rustc_driver" }
+-rustc_driver_impl = { path = "../rustc_driver_impl" }
++rustc_driver = { path = "../rustc_driver", default-features = false }
++rustc_driver_impl = { path = "../rustc_driver_impl", default-features = false }
+ 
+ rustc_public = { path = "../rustc_public" }
+ 
+@@ -35,10 +35,12 @@ features = ['override_allocator_on_supported_platforms']
+ [features]
+ # tidy-alphabetical-start
+ check_only = ['rustc_driver_impl/check_only']
++default = ['logging']
+ jemalloc = ['dep:tikv-jemalloc-sys']
+ llvm = ['rustc_driver_impl/llvm']
+ llvm_enzyme = ['rustc_driver_impl/llvm_enzyme']
+ llvm_offload = ['rustc_driver_impl/llvm_offload']
++logging = ['rustc_driver/logging', 'rustc_driver_impl/logging']
+ max_level_info = ['rustc_driver_impl/max_level_info']
+ rustc_randomized_layouts = ['rustc_driver_impl/rustc_randomized_layouts']
+ # tidy-alphabetical-end
+diff --git a/compiler/rustc_driver/Cargo.toml b/compiler/rustc_driver/Cargo.toml
+index 51909719..f1c3c4f6 100644
+--- a/compiler/rustc_driver/Cargo.toml
++++ b/compiler/rustc_driver/Cargo.toml
+@@ -8,7 +8,13 @@ crate-type = ["dylib"]
+ 
+ [dependencies]
+ # tidy-alphabetical-start
+-rustc_driver_impl = { path = "../rustc_driver_impl" }
++rustc_driver_impl = { path = "../rustc_driver_impl", default-features = false }
++# tidy-alphabetical-end
++
++[features]
++# tidy-alphabetical-start
++default = ['logging']
++logging = ['rustc_driver_impl/logging']
+ # tidy-alphabetical-end
+ 
+ [build-dependencies]
+diff --git a/compiler/rustc_driver_impl/Cargo.toml b/compiler/rustc_driver_impl/Cargo.toml
+index aeb2063e..e3c8f9db 100644
+--- a/compiler/rustc_driver_impl/Cargo.toml
++++ b/compiler/rustc_driver_impl/Cargo.toml
+@@ -22,7 +22,7 @@ rustc_index = { path = "../rustc_index" }
+ rustc_interface = { path = "../rustc_interface" }
+ rustc_lexer = { path = "../rustc_lexer" }
+ rustc_lint = { path = "../rustc_lint" }
+-rustc_log = { path = "../rustc_log" }
++rustc_log = { path = "../rustc_log", default-features = false }
+ rustc_macros = { path = "../rustc_macros" }
+ rustc_metadata = { path = "../rustc_metadata" }
+ rustc_middle = { path = "../rustc_middle" }
+@@ -57,9 +57,11 @@ ctrlc = "3.4.4"
+ [features]
+ # tidy-alphabetical-start
+ check_only = ['rustc_interface/check_only']
++default = ['logging']
+ llvm = ['rustc_interface/llvm']
+ llvm_enzyme = ['rustc_interface/llvm_enzyme']
+ llvm_offload = ['rustc_interface/llvm_offload']
++logging = ['rustc_log/subscriber']
+ max_level_info = ['rustc_log/max_level_info']
+ rustc_randomized_layouts = [
+     'rustc_index/rustc_randomized_layouts',
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 31353d1e..fc02d61b 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -1631,6 +1631,10 @@ pub fn init_logger(early_dcx: &EarlyDiagCtxt, cfg: rustc_log::LoggerConfig) {
+ /// choose the logger config directly rather than having to set an environment variable.
+ /// Moreover, in contrast to `init_logger`, it allows you to add a custom tracing layer
+ /// via `build_subscriber`, for example `|| Registry::default().with(custom_layer)`.
++///
++/// Only available with the `logging` feature: the trait bound names a `tracing_subscriber`
++/// type, which is not linked without it.
++#[cfg(feature = "logging")]
+ pub fn init_logger_with_additional_layer<F, T>(
+     early_dcx: &EarlyDiagCtxt,
+     cfg: rustc_log::LoggerConfig,
+diff --git a/compiler/rustc_log/Cargo.toml b/compiler/rustc_log/Cargo.toml
+index d407351f..41eb6d10 100644
+--- a/compiler/rustc_log/Cargo.toml
++++ b/compiler/rustc_log/Cargo.toml
+@@ -7,11 +7,16 @@ edition = "2024"
+ # tidy-alphabetical-start
+ tracing = "0.1.41"
+ tracing-core = "0.1.34"
+-tracing-subscriber = { version = "0.3.3", default-features = false, features = ["fmt", "env-filter", "smallvec", "parking_lot", "ansi", "json"] }
+-tracing-tree = "0.3.1"
++tracing-subscriber = { version = "0.3.3", default-features = false, features = ["fmt", "env-filter", "smallvec", "parking_lot", "ansi", "json"], optional = true }
++tracing-tree = { version = "0.3.1", optional = true }
+ # tidy-alphabetical-end
+ 
+ [features]
+ # tidy-alphabetical-start
++default = ['subscriber']
+ max_level_info = ['tracing/max_level_info', 'tracing/release_max_level_info']
++# The log subscriber itself: `tracing-subscriber`'s `EnvFilter` and `tracing-tree`. Without it
++# `init_logger` is a stub, and rustc emits no logs. Everything else this crate offers -- the
++# `tracing` re-export tools compile against, `LoggerConfig` -- stays.
++subscriber = ['dep:tracing-subscriber', 'dep:tracing-tree']
+ # tidy-alphabetical-end
+diff --git a/compiler/rustc_log/src/lib.rs b/compiler/rustc_log/src/lib.rs
+index 9976690a..648f5063 100644
+--- a/compiler/rustc_log/src/lib.rs
++++ b/compiler/rustc_log/src/lib.rs
+@@ -33,23 +33,35 @@
+ //! debugging, you can make changes inside those crates and quickly run main.rs
+ //! to read the debug logs.
+ 
++#[cfg(feature = "subscriber")]
+ use std::cell::Cell;
+ use std::env::{self, VarError};
+ use std::fmt::{self, Display};
++#[cfg(feature = "subscriber")]
+ use std::fs::File;
+ use std::io::{self, IsTerminal};
++#[cfg(feature = "subscriber")]
+ use std::sync::Mutex;
+ 
+ use tracing::dispatcher::SetGlobalDefaultError;
++#[cfg(feature = "subscriber")]
+ use tracing::{Event, Subscriber, span};
++#[cfg(feature = "subscriber")]
+ use tracing_subscriber::filter::{Directive, EnvFilter, LevelFilter};
++#[cfg(feature = "subscriber")]
+ use tracing_subscriber::fmt::FmtContext;
++#[cfg(feature = "subscriber")]
+ use tracing_subscriber::fmt::format::{self, FmtSpan, FormatEvent, FormatFields};
++#[cfg(feature = "subscriber")]
+ use tracing_subscriber::fmt::writer::BoxMakeWriter;
++#[cfg(feature = "subscriber")]
+ use tracing_subscriber::layer::{Context, SubscriberExt};
++#[cfg(feature = "subscriber")]
+ use tracing_subscriber::{Layer, Registry};
+ // Re-export tracing
+-pub use {tracing, tracing_core, tracing_subscriber};
++#[cfg(feature = "subscriber")]
++pub use tracing_subscriber;
++pub use {tracing, tracing_core};
+ 
+ /// The values of all the environment variables that matter for configuring a logger.
+ /// Errors are explicitly preserved so that we can share error handling.
+@@ -83,20 +95,33 @@ pub fn from_env(env: &str) -> Self {
+ }
+ 
+ /// Initialize the logger with the given values for the filter, coloring, and other options env variables.
++#[cfg(feature = "subscriber")]
+ pub fn init_logger(cfg: LoggerConfig) -> Result<(), Error> {
+     init_logger_with_additional_layer(cfg, Registry::default)
+ }
+ 
++/// Stub for a build without the `subscriber` feature. There is nothing to install the log
++/// filter into, so report that rather than dropping the logs on the floor.
++#[cfg(not(feature = "subscriber"))]
++pub fn init_logger(cfg: LoggerConfig) -> Result<(), Error> {
++    if cfg.filter.is_ok() {
++        eprintln!("warning: logging was requested, but this build has no tracing subscriber");
++    }
++    Ok(())
++}
++
+ /// Trait alias for the complex return type of `build_subscriber` in
+ /// [init_logger_with_additional_layer]. A [Registry] with any composition of [tracing::Subscriber]s
+ /// (e.g. `Registry::default().with(custom_layer)`) should be compatible with this type.
+ /// Having an alias is also useful so rustc_driver_impl does not need to explicitly depend on
+ /// `tracing_subscriber`.
++#[cfg(feature = "subscriber")]
+ pub trait BuildSubscriberRet:
+     tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + Send + Sync
+ {
+ }
+ 
++#[cfg(feature = "subscriber")]
+ impl<
+     T: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span> + Send + Sync,
+ > BuildSubscriberRet for T
+@@ -106,6 +131,7 @@ impl<
+ /// Initialize the logger with the given values for the filter, coloring, and other options env variables.
+ /// Additionally add a custom layer to collect logging and tracing events via `build_subscriber`,
+ /// for example: `|| Registry::default().with(custom_layer)`.
++#[cfg(feature = "subscriber")]
+ pub fn init_logger_with_additional_layer<F, T>(
+     cfg: LoggerConfig,
+     build_subscriber: F,
+@@ -219,10 +245,12 @@ pub fn init_logger_with_additional_layer<F, T>(
+     Ok(())
+ }
+ 
++#[cfg(feature = "subscriber")]
+ struct BacktraceFormatter {
+     backtrace_target: String,
+ }
+ 
++#[cfg(feature = "subscriber")]
+ impl<S, N> FormatEvent<S, N> for BacktraceFormatter
+ where
+     S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+@@ -289,18 +317,22 @@ fn from(tracing_error: SetGlobalDefaultError) -> Self {
+     }
+ }
+ 
++#[cfg(feature = "subscriber")]
+ thread_local! {
+     static NONRECURSIVE_GUARD_LOCK: Cell<bool> = const { Cell::new(false) };
+ }
+ 
++#[cfg(feature = "subscriber")]
+ struct NonrecursiveGuard;
+ 
++#[cfg(feature = "subscriber")]
+ impl NonrecursiveGuard {
+     fn lock() -> Option<NonrecursiveGuard> {
+         if !NONRECURSIVE_GUARD_LOCK.replace(true) { Some(NonrecursiveGuard) } else { None }
+     }
+ }
+ 
++#[cfg(feature = "subscriber")]
+ impl Drop for NonrecursiveGuard {
+     fn drop(&mut self) {
+         NONRECURSIVE_GUARD_LOCK.set(false);
+@@ -312,10 +344,12 @@ fn drop(&mut self) {
+ /// default output format) filters these out, but [`tracing_subscriber::fmt::format::Json`] (used by
+ /// `RUSTC_LOG_FORMAT_JSON`) does not. So, implement a simple recursion check to filter these
+ /// messages out.
++#[cfg(feature = "subscriber")]
+ struct NonrecursiveLayer<S> {
+     inner: S,
+ }
+ 
++#[cfg(feature = "subscriber")]
+ impl<S: Subscriber, L: Layer<S>> Layer<S> for NonrecursiveLayer<L> {
+     fn on_register_dispatch(&self, subscriber: &tracing::Dispatch) {
+         self.inner.on_register_dispatch(subscriber)
+diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
+index ffbe4f4e..fae2378c 100644
+--- a/src/bootstrap/src/core/build_steps/compile.rs
++++ b/src/bootstrap/src/core/build_steps/compile.rs
+@@ -1225,6 +1225,12 @@ pub fn rustc_cargo(
+     build_compiler: &Compiler,
+     crates: &[String],
+ ) {
++    // `logging` is the only default feature of `rustc-main`, so dropping the defaults is how
++    // it is turned off; `rustc_features` can only add features, never remove them.
++    if !builder.config.rust_logging {
++        cargo.arg("--no-default-features");
++    }
++
+     cargo
+         .arg("--features")
+         .arg(builder.rustc_features(builder.kind, target, crates))
+diff --git a/src/bootstrap/src/core/config/config.rs b/src/bootstrap/src/core/config/config.rs
+index 267e21c5..540d90d1 100644
+--- a/src/bootstrap/src/core/config/config.rs
++++ b/src/bootstrap/src/core/config/config.rs
+@@ -206,6 +206,7 @@ pub struct Config {
+     pub rust_overflow_checks: bool,
+     pub rust_overflow_checks_std: bool,
+     pub rust_debug_logging: bool,
++    pub rust_logging: bool,
+     pub rust_debuginfo_level_rustc: DebuginfoLevel,
+     pub rust_debuginfo_level_std: DebuginfoLevel,
+     pub rust_debuginfo_level_tools: DebuginfoLevel,
+@@ -546,6 +547,7 @@ pub(crate) fn parse_inner(
+             overflow_checks: rust_overflow_checks,
+             overflow_checks_std: rust_overflow_checks_std,
+             debug_logging: rust_debug_logging,
++            logging: rust_logging,
+             debuginfo_level: rust_debuginfo_level,
+             debuginfo_level_rustc: rust_debuginfo_level_rustc,
+             debuginfo_level_std: rust_debuginfo_level_std,
+@@ -1477,6 +1479,7 @@ pub(crate) fn parse_inner(
+             rust_debug_logging: rust_debug_logging
+                 .or(rust_rustc_debug_assertions)
+                 .unwrap_or(rust_debug == Some(true)),
++            rust_logging: rust_logging.unwrap_or(true),
+             rust_debuginfo_level_rustc: with_defaults(rust_debuginfo_level_rustc),
+             rust_debuginfo_level_std: with_defaults(rust_debuginfo_level_std),
+             rust_debuginfo_level_tests: rust_debuginfo_level_tests.unwrap_or(DebuginfoLevel::None),
+diff --git a/src/bootstrap/src/core/config/toml/rust.rs b/src/bootstrap/src/core/config/toml/rust.rs
+index 2facf839..04d14d0a 100644
+--- a/src/bootstrap/src/core/config/toml/rust.rs
++++ b/src/bootstrap/src/core/config/toml/rust.rs
+@@ -23,6 +23,7 @@ struct Rust {
+         overflow_checks: Option<bool> = "overflow-checks",
+         overflow_checks_std: Option<bool> = "overflow-checks-std",
+         debug_logging: Option<bool> = "debug-logging",
++        logging: Option<bool> = "logging",
+         debuginfo_level: Option<DebuginfoLevel> = "debuginfo-level",
+         debuginfo_level_rustc: Option<DebuginfoLevel> = "debuginfo-level-rustc",
+         debuginfo_level_std: Option<DebuginfoLevel> = "debuginfo-level-std",
+@@ -322,6 +323,7 @@ macro_rules! warn {
+         optimize,
+         randomize_layout,
+         debug_logging,
++        logging,
+         debuginfo_level_rustc,
+         compress_debuginfo,
+         llvm_tools,
+@@ -393,6 +395,7 @@ macro_rules! warn {
+     err!(current_rust_config.randomize_layout, randomize_layout, "rust");
+     err!(current_rust_config.compress_debuginfo, compress_debuginfo, "rust");
+     err!(current_rust_config.debug_logging, debug_logging, "rust");
++    err!(current_rust_config.logging, logging, "rust");
+     err!(current_rust_config.debuginfo_level_rustc, debuginfo_level_rustc, "rust");
+     err!(current_rust_config.rpath, rpath, "rust");
+     err!(current_rust_config.strip, strip, "rust");
+diff --git a/src/bootstrap/src/utils/change_tracker.rs b/src/bootstrap/src/utils/change_tracker.rs
+index b34c1b55..d7a960b0 100644
+--- a/src/bootstrap/src/utils/change_tracker.rs
++++ b/src/bootstrap/src/utils/change_tracker.rs
+@@ -636,4 +636,9 @@ pub fn human_readable_changes(changes: &[ChangeInfo]) -> String {
+         severity: ChangeSeverity::Info,
+         summary: "New option `rust.compress-debuginfo` allows configuring whether Rust and C/C++ debuginfo should be compressed.",
+     },
++    ChangeInfo {
++        change_id: 158170,
++        severity: ChangeSeverity::Info,
++        summary: "New option `rust.logging` (default true) controls whether a tracing subscriber is linked into the compiler; with it off `RUSTC_LOG` has no effect.",
++    },
+ ];
+-- 
+2.52.0
+

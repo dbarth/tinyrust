@@ -1,0 +1,310 @@
+From 8d9009c4d1dc86830872b5910b4f90e142b02a59 Mon Sep 17 00:00:00 2001
+From: David Barth <dbarth4@gmail.com>
+Date: Sun, 30 Aug 2026 14:41:59 +0200
+Subject: [PATCH] WIP: make the Fluent list formatter work without ICU
+
+DO NOT MERGE. The code change is complete and correct; the build plumbing
+is not. See the last paragraph.
+
+`rustc_error_messages` links `icu_list`, `icu_locale` and the baked ICU data
+to format one thing: the Fluent `STRLIST` values in diagnostics such as
+"unused imports: `a`, `b`, and `c`". That drags in the whole ICU data model --
+`icu_provider`, `yoke`, `zerovec`, `zerofrom`, `tinystr` -- for a list
+separator.
+
+Add an `icu` feature gating the three dependencies, with a fallback that
+formats lists the English way. The fallback is byte-for-byte what
+`ListFormatter` produces for `en`, which is both the locale rustc ships
+messages for and the one it already falls back to when the requested locale
+is unknown. Verified identical output with the feature on and off for lists
+of two, three and four items.
+
+Bootstrap gains `rust.icu` (default true) and enables the feature the way
+`rust.debug-logging` enables `max_level_info`.
+
+Measured on a stage1 `librustc_driver` for aarch64-apple-darwin, `strip -x`ed:
+111,360,864 -> 110,682,584 bytes, -678,280.
+
+What blocks this: `x build compiler` runs two `Mode::Rustc` cargo
+invocations, one over `-p <every compiler crate>` with
+`--features "llvm rustc max_level_info"` and one over bare `rustc-main` with
+`--features "llvm max_level_info"`. In the first, `rustc_error_messages` is a
+selected root package, so a feature on it applies directly; in the second it
+is only reached transitively. Giving it any feature at all makes the two
+invocations resolve it to two distinct units, and every crate downstream of
+it -- almost the whole compiler -- is built twice. Both copies are placed in
+the same stage sysroot, so `rustdoc`, `clippy`, `miri` and
+`error_index_generator` then fail with E0464, multiple candidates. This
+happens with `rust.icu` left at its default as well as switched off.
+
+Both feature mechanisms were tried and both double the build: a `default`
+feature dropped with `--no-default-features`, and an additive feature pushed
+from `rustc_features`. On an unpatched tree each compiler crate is compiled
+once; with either version of this patch, twice. Gating a crate this deep in
+the graph needs bootstrap to build the compiler through one cargo invocation,
+which is out of scope here.
+---
+ Cargo.lock                                 |  1 +
+ bootstrap.example.toml                     |  8 ++++++
+ compiler/rustc/Cargo.toml                  |  5 ++++
+ compiler/rustc_error_messages/Cargo.toml   | 15 ++++++++--
+ compiler/rustc_error_messages/src/lib.rs   | 32 ++++++++++++++++++++++
+ src/bootstrap/src/core/config/config.rs    |  3 ++
+ src/bootstrap/src/core/config/toml/rust.rs |  3 ++
+ src/bootstrap/src/lib.rs                   |  6 ++++
+ src/bootstrap/src/utils/change_tracker.rs  |  5 ++++
+ 9 files changed, 75 insertions(+), 3 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 873182dd..9a2760f8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3514,6 +3514,7 @@ dependencies = [
+  "rustc_codegen_ssa",
+  "rustc_driver",
+  "rustc_driver_impl",
++ "rustc_error_messages",
+  "rustc_public",
+  "rustc_public_bridge",
+  "rustc_windows_rc",
+diff --git a/bootstrap.example.toml b/bootstrap.example.toml
+index 1ca4bc91..c0ca21c1 100644
+--- a/bootstrap.example.toml
++++ b/bootstrap.example.toml
+@@ -658,6 +658,14 @@
+ # are disabled statically" because `max_level_info` is enabled, set this value to `true`.
+ #rust.debug-logging = rust.debug-assertions (boolean)
+ 
++# Whether to link ICU into the compiler for locale-correct list formatting in diagnostics.
++#
++# With this off, the `icu_list`, `icu_locale` and `rustc_baked_icu_data` crates are not linked and
++# Fluent lists are formatted the English way ("a, b, and c"), which is what ICU produces for the
++# only locale rustc ships messages for. Turn it off only if you do not point `-Ztranslate-lang`
++# at a translation of your own.
++#rust.icu = true
++
+ # Whether or not to build rustc, tools and the libraries with randomized type layout
+ #rust.randomize-layout = false
+ 
+diff --git a/compiler/rustc/Cargo.toml b/compiler/rustc/Cargo.toml
+index 8cef9e06..28fe5664 100644
+--- a/compiler/rustc/Cargo.toml
++++ b/compiler/rustc/Cargo.toml
+@@ -13,6 +13,10 @@ rustc_codegen_ssa = { path = "../rustc_codegen_ssa" }
+ rustc_driver = { path = "../rustc_driver" }
+ rustc_driver_impl = { path = "../rustc_driver_impl" }
+ 
++# Not used here. `rustc_error_messages` is deep in the graph, so this is where bootstrap
++# reaches its `icu` feature when it builds the whole compiler at once.
++rustc_error_messages = { path = "../rustc_error_messages" }
++
+ rustc_public = { path = "../rustc_public" }
+ 
+ # Make sure rustc_public_bridge ends up in the sysroot, because this
+@@ -35,6 +39,7 @@ features = ['override_allocator_on_supported_platforms']
+ [features]
+ # tidy-alphabetical-start
+ check_only = ['rustc_driver_impl/check_only']
++icu = ['rustc_error_messages/icu']
+ jemalloc = ['dep:tikv-jemalloc-sys']
+ llvm = ['rustc_driver_impl/llvm']
+ llvm_enzyme = ['rustc_driver_impl/llvm_enzyme']
+diff --git a/compiler/rustc_error_messages/Cargo.toml b/compiler/rustc_error_messages/Cargo.toml
+index 50f0b265..577fb557 100644
+--- a/compiler/rustc_error_messages/Cargo.toml
++++ b/compiler/rustc_error_messages/Cargo.toml
+@@ -6,13 +6,22 @@ edition = "2024"
+ [dependencies]
+ # tidy-alphabetical-start
+ fluent-bundle = "0.16"
+-icu_list = { version = "2.2", default-features = false, features = ["alloc"] }
+-icu_locale = { version = "2.2", default-features = false }
++icu_list = { version = "2.2", default-features = false, features = ["alloc"], optional = true }
++icu_locale = { version = "2.2", default-features = false, optional = true }
+ intl-memoizer = "0.5.1"
+-rustc_baked_icu_data = { path = "../rustc_baked_icu_data" }
++rustc_baked_icu_data = { path = "../rustc_baked_icu_data", optional = true }
+ rustc_data_structures = { path = "../rustc_data_structures" }
+ rustc_macros = { path = "../rustc_macros" }
+ rustc_serialize = { path = "../rustc_serialize" }
+ rustc_span = { path = "../rustc_span" }
+ unic-langid = { version = "0.9.0", features = ["macros"] }
+ # tidy-alphabetical-end
++
++[features]
++# tidy-alphabetical-start
++# Locale-correct list formatting for the Fluent `STRLIST` values in diagnostics. Without it
++# lists are formatted the way ICU formats them for `en`, and the ICU data and the crates that
++# read it are not linked. Enabled by bootstrap unless `rust.icu` is false, the same way
++# `max_level_info` is.
++icu = ['dep:icu_list', 'dep:icu_locale', 'dep:rustc_baked_icu_data']
++# tidy-alphabetical-end
+diff --git a/compiler/rustc_error_messages/src/lib.rs b/compiler/rustc_error_messages/src/lib.rs
+index 2722db06..c69517f8 100644
+--- a/compiler/rustc_error_messages/src/lib.rs
++++ b/compiler/rustc_error_messages/src/lib.rs
+@@ -219,10 +219,24 @@ fn from(spans: Vec<Span>) -> MultiSpan {
+     }
+ }
+ 
++#[cfg(feature = "icu")]
+ fn icu_locale_from_unic_langid(lang: LanguageIdentifier) -> Option<icu_locale::Locale> {
+     icu_locale::Locale::try_from_str(&lang.to_string()).ok()
+ }
+ 
++/// English list formatting, for a build without the `icu` feature. This is what ICU produces
++/// for the `en` locale, which is also the fallback ICU is asked for when the requested locale
++/// is unknown.
++#[cfg(not(feature = "icu"))]
++fn list_sep_by_and(list: &[String]) -> String {
++    match list {
++        [] => String::new(),
++        [one] => one.clone(),
++        [one, two] => format!("{one} and {two}"),
++        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
++    }
++}
++
+ pub fn fluent_value_from_str_list_sep_by_and(l: Vec<Cow<'_, str>>) -> FluentValue<'_> {
+     // Fluent requires 'static value here for its AnyEq usages.
+     #[derive(Clone, PartialEq, Debug)]
+@@ -233,6 +247,7 @@ fn duplicate(&self) -> Box<dyn FluentType + Send> {
+             Box::new(self.clone())
+         }
+ 
++        #[cfg(feature = "icu")]
+         fn as_string(&self, intls: &intl_memoizer::IntlLangMemoizer) -> Cow<'static, str> {
+             let result = intls
+                 .with_try_get::<MemoizableListFormatter, _, _>((), |list_formatter| {
+@@ -242,6 +257,12 @@ fn as_string(&self, intls: &intl_memoizer::IntlLangMemoizer) -> Cow<'static, str
+             Cow::Owned(result)
+         }
+ 
++        #[cfg(not(feature = "icu"))]
++        fn as_string(&self, _intls: &intl_memoizer::IntlLangMemoizer) -> Cow<'static, str> {
++            Cow::Owned(list_sep_by_and(&self.0))
++        }
++
++        #[cfg(feature = "icu")]
+         fn as_string_threadsafe(
+             &self,
+             intls: &intl_memoizer::concurrent::IntlLangMemoizer,
+@@ -253,10 +274,20 @@ fn as_string_threadsafe(
+                 .unwrap();
+             Cow::Owned(result)
+         }
++
++        #[cfg(not(feature = "icu"))]
++        fn as_string_threadsafe(
++            &self,
++            _intls: &intl_memoizer::concurrent::IntlLangMemoizer,
++        ) -> Cow<'static, str> {
++            Cow::Owned(list_sep_by_and(&self.0))
++        }
+     }
+ 
++    #[cfg(feature = "icu")]
+     struct MemoizableListFormatter(icu_list::ListFormatter);
+ 
++    #[cfg(feature = "icu")]
+     impl std::ops::Deref for MemoizableListFormatter {
+         type Target = icu_list::ListFormatter;
+         fn deref(&self) -> &Self::Target {
+@@ -264,6 +295,7 @@ fn deref(&self) -> &Self::Target {
+         }
+     }
+ 
++    #[cfg(feature = "icu")]
+     impl intl_memoizer::Memoizable for MemoizableListFormatter {
+         type Args = ();
+         type Error = ();
+diff --git a/src/bootstrap/src/core/config/config.rs b/src/bootstrap/src/core/config/config.rs
+index 267e21c5..b1280cd8 100644
+--- a/src/bootstrap/src/core/config/config.rs
++++ b/src/bootstrap/src/core/config/config.rs
+@@ -206,6 +206,7 @@ pub struct Config {
+     pub rust_overflow_checks: bool,
+     pub rust_overflow_checks_std: bool,
+     pub rust_debug_logging: bool,
++    pub rust_icu: bool,
+     pub rust_debuginfo_level_rustc: DebuginfoLevel,
+     pub rust_debuginfo_level_std: DebuginfoLevel,
+     pub rust_debuginfo_level_tools: DebuginfoLevel,
+@@ -546,6 +547,7 @@ pub(crate) fn parse_inner(
+             overflow_checks: rust_overflow_checks,
+             overflow_checks_std: rust_overflow_checks_std,
+             debug_logging: rust_debug_logging,
++            icu: rust_icu,
+             debuginfo_level: rust_debuginfo_level,
+             debuginfo_level_rustc: rust_debuginfo_level_rustc,
+             debuginfo_level_std: rust_debuginfo_level_std,
+@@ -1477,6 +1479,7 @@ pub(crate) fn parse_inner(
+             rust_debug_logging: rust_debug_logging
+                 .or(rust_rustc_debug_assertions)
+                 .unwrap_or(rust_debug == Some(true)),
++            rust_icu: rust_icu.unwrap_or(true),
+             rust_debuginfo_level_rustc: with_defaults(rust_debuginfo_level_rustc),
+             rust_debuginfo_level_std: with_defaults(rust_debuginfo_level_std),
+             rust_debuginfo_level_tests: rust_debuginfo_level_tests.unwrap_or(DebuginfoLevel::None),
+diff --git a/src/bootstrap/src/core/config/toml/rust.rs b/src/bootstrap/src/core/config/toml/rust.rs
+index 2facf839..fbbe2574 100644
+--- a/src/bootstrap/src/core/config/toml/rust.rs
++++ b/src/bootstrap/src/core/config/toml/rust.rs
+@@ -23,6 +23,7 @@ struct Rust {
+         overflow_checks: Option<bool> = "overflow-checks",
+         overflow_checks_std: Option<bool> = "overflow-checks-std",
+         debug_logging: Option<bool> = "debug-logging",
++        icu: Option<bool> = "icu",
+         debuginfo_level: Option<DebuginfoLevel> = "debuginfo-level",
+         debuginfo_level_rustc: Option<DebuginfoLevel> = "debuginfo-level-rustc",
+         debuginfo_level_std: Option<DebuginfoLevel> = "debuginfo-level-std",
+@@ -322,6 +323,7 @@ macro_rules! warn {
+         optimize,
+         randomize_layout,
+         debug_logging,
++        icu,
+         debuginfo_level_rustc,
+         compress_debuginfo,
+         llvm_tools,
+@@ -393,6 +395,7 @@ macro_rules! warn {
+     err!(current_rust_config.randomize_layout, randomize_layout, "rust");
+     err!(current_rust_config.compress_debuginfo, compress_debuginfo, "rust");
+     err!(current_rust_config.debug_logging, debug_logging, "rust");
++    err!(current_rust_config.icu, icu, "rust");
+     err!(current_rust_config.debuginfo_level_rustc, debuginfo_level_rustc, "rust");
+     err!(current_rust_config.rpath, rpath, "rust");
+     err!(current_rust_config.strip, strip, "rust");
+diff --git a/src/bootstrap/src/lib.rs b/src/bootstrap/src/lib.rs
+index 2231e088..af39d4b5 100644
+--- a/src/bootstrap/src/lib.rs
++++ b/src/bootstrap/src/lib.rs
+@@ -902,6 +902,12 @@ fn rustc_features(&self, kind: Kind, target: TargetSelection, crates: &[String])
+             features.push("max_level_info");
+         }
+ 
++        // ICU is only needed to format Fluent lists for a locale rustc does not ship messages
++        // for. Off, the English formatting ICU would have produced is used instead.
++        if self.config.rust_icu && check("icu") {
++            features.push("icu");
++        }
++
+         features.join(" ")
+     }
+ 
+diff --git a/src/bootstrap/src/utils/change_tracker.rs b/src/bootstrap/src/utils/change_tracker.rs
+index b34c1b55..0af7758b 100644
+--- a/src/bootstrap/src/utils/change_tracker.rs
++++ b/src/bootstrap/src/utils/change_tracker.rs
+@@ -636,4 +636,9 @@ pub fn human_readable_changes(changes: &[ChangeInfo]) -> String {
+         severity: ChangeSeverity::Info,
+         summary: "New option `rust.compress-debuginfo` allows configuring whether Rust and C/C++ debuginfo should be compressed.",
+     },
++    ChangeInfo {
++        change_id: 158171,
++        severity: ChangeSeverity::Info,
++        summary: "New option `rust.icu` (default true) controls whether ICU is linked for locale-correct list formatting in diagnostics.",
++    },
+ ];
+-- 
+2.52.0
+

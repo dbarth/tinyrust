@@ -1,0 +1,78 @@
+From c3928e98c3c44f42985dd42f4f3bd1983290af41 Mon Sep 17 00:00:00 2001
+From: David Barth <dbarth4@gmail.com>
+Date: Sun, 30 Aug 2026 17:11:16 +0200
+Subject: [PATCH] add RUSTC_ONLY_RUSTFLAGS, rustflags for the compiler and what
+ links it, never std
+
+---
+ src/bootstrap/src/core/builder/cargo.rs       | 29 +++++++++++++++++++
+ .../bootstrapping/what-bootstrapping-does.md  |  6 ++++
+ 2 files changed, 35 insertions(+)
+
+diff --git a/src/bootstrap/src/core/builder/cargo.rs b/src/bootstrap/src/core/builder/cargo.rs
+index db3f3938..f41a7c5c 100644
+--- a/src/bootstrap/src/core/builder/cargo.rs
++++ b/src/bootstrap/src/core/builder/cargo.rs
+@@ -76,6 +76,30 @@ fn propagate_rustflag_envs(&mut self, build_compiler_stage: u32) {
+             self.arg("--cfg=bootstrap");
+         }
+     }
++
++    /// Flags for the compiler and the tools that link it, and for nothing else.
++    ///
++    /// `RUSTFLAGS_BOOTSTRAP` reaches [`Mode::Std`] as well, so it cannot carry a flag that
++    /// changes the shipped standard library: users get whatever `std` was built with, while
++    /// the compiler is ours to shrink. This env var covers [`Mode::Rustc`], [`Mode::Codegen`]
++    /// and [`Mode::ToolRustcPrivate`] only.
++    ///
++    /// `ToolRustcPrivate` is included because those tools (clippy, miri, rustfmt,
++    /// rust-analyzer) link `librustc_driver`, and options such as `-Cpanic=abort` have to
++    /// match across everything in one link, or the dependency-format check rejects the tool.
++    ///
++    /// Unlike `RUSTFLAGS_BOOTSTRAP` this is not split by build compiler stage. The flags
++    /// describe the compiler being produced, not the compiler producing it, so they apply at
++    /// every stage: a stage 1 rustc is built by stage 0 and a stage 2 tool is built by
++    /// stage 1, and both should get the same treatment.
++    fn propagate_rustc_only_rustflag_env(&mut self, mode: Mode) {
++        match mode {
++            Mode::Rustc | Mode::Codegen | Mode::ToolRustcPrivate => {
++                self.env("RUSTC_ONLY_RUSTFLAGS");
++            }
++            Mode::Std | Mode::ToolBootstrap | Mode::ToolStd | Mode::ToolTarget => {}
++        }
++    }
+ }
+ 
+ /// Flags that are passed to the `rustc` shim binary. These flags will only be applied when
+@@ -460,6 +484,11 @@ fn from(mut cargo: Cargo) -> BootstrapCommand {
+         cargo.rustflags.propagate_rustflag_envs(cargo.build_compiler_stage);
+         cargo.rustdocflags.propagate_rustflag_envs(cargo.build_compiler_stage);
+ 
++        // Compiler-only flags come last, so they win over anything above. They are deliberately
++        // not added to `rustdocflags`: rustdoc never links what it documents, so a flag like
++        // `-Cpanic=abort` there only invalidates fingerprints.
++        cargo.rustflags.propagate_rustc_only_rustflag_env(cargo.mode);
++
+         cargo.rustdocflags.propagate_cargo_env("RUSTDOCFLAGS");
+ 
+         if cargo.build_compiler_stage == 0 {
+diff --git a/src/doc/rustc-dev-guide/src/building/bootstrapping/what-bootstrapping-does.md b/src/doc/rustc-dev-guide/src/building/bootstrapping/what-bootstrapping-does.md
+index 0623d176..7bb28f31 100644
+--- a/src/doc/rustc-dev-guide/src/building/bootstrapping/what-bootstrapping-does.md
++++ b/src/doc/rustc-dev-guide/src/building/bootstrapping/what-bootstrapping-does.md
+@@ -370,6 +370,12 @@ will be rare to want to use it.
+ Finally, `MAGIC_EXTRA_RUSTFLAGS` bypasses the
+ `cargo` cache to pass flags to rustc without recompiling all dependencies.
+ 
++- `RUSTC_ONLY_RUSTFLAGS` is passed as `RUSTFLAGS` when building the compiler
++  (`Mode::Rustc`, `Mode::Codegen`) and the tools that link it
++  (`Mode::ToolRustcPrivate`), at every stage. It never reaches the standard
++  library, so it is the place for flags that should change the compiler you
++  build but not the `std` your compiler ships, such as `-Cpanic=abort` or
++  `-Zlocation-detail=none`.
+ - `RUSTDOCFLAGS`, `RUSTDOCFLAGS_BOOTSTRAP` and `RUSTDOCFLAGS_NOT_BOOTSTRAP` are
+   analogous to `RUSTFLAGS`, but for `rustdoc`.
+ - `CARGOFLAGS` will pass arguments to cargo itself (e.g. `--timings`).
+-- 
+2.52.0
+

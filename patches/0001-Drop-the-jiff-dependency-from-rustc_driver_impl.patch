@@ -1,0 +1,132 @@
+From da6511dbfc6f3f28bca2d7e9e064eceab47f75ac Mon Sep 17 00:00:00 2001
+From: David Barth <dbarth4@gmail.com>
+Date: Sun, 30 Aug 2026 13:14:19 +0200
+Subject: [PATCH] Drop the jiff dependency from rustc_driver_impl
+
+jiff is pulled in for exactly one call site: naming an ICE dump file
+`rustc-ice-<timestamp>-<pid>.txt`. That costs about 0.5 MB in
+librustc_driver for a wall clock read and a six-field format.
+
+Replace it with `SystemTime` and an inline days-to-civil-date conversion
+(Howard Hinnant's `civil_from_days`).
+
+This is not a behaviour change. rustc already depends on jiff with
+`default-features = false, features = ["std"]`, which leaves `tz-system`
+and every `tzdb-*` feature off, so `TimeZone::try_system()` always fails
+and `Zoned::now()` already falls back to `Etc/Unknown` -- UTC. The
+filenames rustc writes today are UTC and stay UTC.
+
+Measured on a stage1 `librustc_driver` for aarch64-apple-darwin,
+`strip -x`ed: 111,360,864 -> 110,857,848 bytes, -503,016.
+
+For comparison, keeping jiff and only switching `Zoned::now()` to
+`Timestamp::now()` saves 16,536 bytes, confirming the weight is the
+crate rather than the timezone-aware type.
+
+`portable-atomic-util` leaves PERMITTED_RUSTC_DEPENDENCIES with it; jiff
+was its only path into the rustc dependency graph. jiff stays in
+Cargo.lock because env_logger, outside that graph, still uses it.
+---
+ Cargo.lock                            |  1 -
+ compiler/rustc_driver_impl/Cargo.toml |  1 -
+ compiler/rustc_driver_impl/src/lib.rs | 25 ++++++++++++++++++++++---
+ src/tools/tidy/src/deps.rs            |  3 ---
+ 4 files changed, 22 insertions(+), 8 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 873182dd..e71c2bc9 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3894,7 +3894,6 @@ version = "0.0.0"
+ dependencies = [
+  "anstyle",
+  "ctrlc",
+- "jiff",
+  "libc",
+  "rustc_abi",
+  "rustc_ast",
+diff --git a/compiler/rustc_driver_impl/Cargo.toml b/compiler/rustc_driver_impl/Cargo.toml
+index aeb2063e..9ea0f30c 100644
+--- a/compiler/rustc_driver_impl/Cargo.toml
++++ b/compiler/rustc_driver_impl/Cargo.toml
+@@ -6,7 +6,6 @@ edition = "2024"
+ [dependencies]
+ # tidy-alphabetical-start
+ anstyle = "1.0.13"
+-jiff = { version = "0.2.5", default-features = false, features = ["std"] }
+ rustc_abi = { path = "../rustc_abi" }
+ rustc_ast = { path = "../rustc_ast" }
+ rustc_ast_pretty = { path = "../rustc_ast_pretty" }
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 31353d1e..366916cb 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -24,7 +24,7 @@
+ use std::process::{Command, ExitCode, Stdio, Termination};
+ use std::sync::OnceLock;
+ use std::sync::atomic::{AtomicBool, Ordering};
+-use std::time::Instant;
++use std::time::{Instant, SystemTime, UNIX_EPOCH};
+ use std::{env, str};
+ 
+ use rustc_ast as ast;
+@@ -1421,14 +1421,33 @@ fn ice_path_with_config(config: Option<&UnstableOptions>) -> &'static Option<Pat
+                 .or_else(|| std::env::current_dir().ok())
+                 .unwrap_or_default(),
+         };
+-        // Don't use a standard datetime format because Windows doesn't support `:` in paths
+-        let file_now = jiff::Zoned::now().strftime("%Y-%m-%dT%H_%M_%S");
++        let file_now = utc_timestamp();
+         let pid = std::process::id();
+         path.push(format!("rustc-ice-{file_now}-{pid}.txt"));
+         Some(path)
+     })
+ }
+ 
++/// The current UTC time as `%Y-%m-%dT%H_%M_%S`.
++///
++/// Not a standard datetime format because Windows does not support `:` in paths.
++fn utc_timestamp() -> String {
++    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
++    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
++    let (hour, min, sec) = (rem / 3_600, rem / 60 % 60, rem % 60);
++    // Days since the epoch to a civil date, after Howard Hinnant's `civil_from_days`.
++    let z = days + 719_468;
++    let era = z.div_euclid(146_097);
++    let doe = z.rem_euclid(146_097);
++    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
++    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++    let mp = (5 * doy + 2) / 153;
++    let day = doy - (153 * mp + 2) / 5 + 1;
++    let month = if mp < 10 { mp + 3 } else { mp - 9 };
++    let year = yoe + era * 400 + i64::from(month <= 2);
++    format!("{year:04}-{month:02}-{day:02}T{hour:02}_{min:02}_{sec:02}")
++}
++
+ pub static USING_INTERNAL_FEATURES: AtomicBool = AtomicBool::new(false);
+ 
+ /// Installs a panic hook that will print the ICE message on unexpected panics.
+diff --git a/src/tools/tidy/src/deps.rs b/src/tools/tidy/src/deps.rs
+index 89aae46e..dab06b5a 100644
+--- a/src/tools/tidy/src/deps.rs
++++ b/src/tools/tidy/src/deps.rs
+@@ -357,8 +357,6 @@ pub(crate) struct WorkspaceInfo<'a> {
+     "is_terminal_polyfill",
+     "itertools",
+     "itoa",
+-    "jiff",
+-    "jiff-static",
+     "jobserver",
+     "lazy_static",
+     "leb128",
+@@ -389,7 +387,6 @@ pub(crate) struct WorkspaceInfo<'a> {
+     "pin-project-lite",
+     "polonius-engine",
+     "portable-atomic", // dependency for platforms doesn't support `AtomicU64` in std
+-    "portable-atomic-util",
+     "potential_utf",
+     "ppv-lite86",
+     "proc-macro-hack",
+-- 
+2.52.0
+
