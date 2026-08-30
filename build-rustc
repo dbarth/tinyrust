@@ -6,7 +6,7 @@
 #   build-rustc zstd       build the one library our binaries link, pinned
 #   build-rustc llvm       fetch and prune wasmer's LLVM into ./llvm
 #   build-rustc llvm-pack  tar the pruned ./llvm for publishing
-#   build-rustc fetch      clone rust at the pinned version
+#   build-rustc fetch      clone rust at the pinned version and apply ./patches
 #   build-rustc configure  write bootstrap.toml pointing at ./llvm
 #   build-rustc build      ./x build  (RUSTC_STAGE=2 for a self-hosted build)
 #   build-rustc strip      strip the compiler binaries (not std)
@@ -292,6 +292,14 @@ LLVM_TOOLS_KEEP="${RUSTC_LLVM_TOOLS_KEEP:-rust-objcopy}"
 # means better optimisation and slower builds; with fat LTO the units are
 # merged anyway, so this mostly affects the pre-LTO stage.
 CGU="${RUSTC_CGU:-}"
+
+# Patches applied to the source at fetch, by number in ./patches.
+PATCHES="${RUSTC_PATCHES:-0004 0005}"
+# rustflags for the compiler and the tools that link it, never std. Needs patch
+# 0005. shallow trims derived Debug to the type name and leaves hand-written
+# impls alone; none blanks every {:?} and takes rustc's own diagnostics with it.
+# -6.4 MB on the stripped driver, -8.3 MB with patch 0004.
+RUSTC_FLAGS="${RUSTC_ONLY_RUSTFLAGS:--Zfmt-debug=shallow -Zlocation-detail=none}"
 
 check_llvm() {
   [ -x "$LLVM/bin/llvm-config" ] || die "no llvm-config in $LLVM -- see NOTES.md"
@@ -601,6 +609,25 @@ cmd_fetch() {
   git -C "$SRC" submodule update --init --depth 1 \
     library/backtrace library/stdarch src/tools/cargo 2>/dev/null || true
   note "at $(git -C "$SRC" describe --tags 2>/dev/null || echo "$VERSION")"
+  apply_patches
+}
+
+# Applied here rather than as a step of their own, so no caller can build an
+# unpatched source and silently lose the flags that depend on 0005.
+apply_patches() {
+  local n f p
+  for n in $PATCHES; do
+    p=""
+    for f in "$HERE"/patches/"$n"-*.patch; do [ -f "$f" ] && p="$f"; done
+    [ -n "$p" ] || die "no patch $n in $HERE/patches"
+    if git -C "$SRC" apply --check "$p" 2>/dev/null; then
+      git -C "$SRC" apply "$p" && note "patch    $(basename "$p")"
+    elif git -C "$SRC" apply --check --reverse "$p" 2>/dev/null; then
+      note "patch    $(basename "$p") already in"
+    else
+      die "patch $(basename "$p") does not apply to rust $VERSION"
+    fi
+  done
 }
 
 cmd_configure() {
@@ -687,6 +714,15 @@ cmd_build() {
     *zstd*) [ -f "$ZSTD_LIB/libzstd.a" ] || die "no zstd for $HOST -- run '$0 zstd'" ;;
   esac
   note "system-libs  $("$LLVM/bin/llvm-config" --system-libs --link-static)"
+
+  # Patch 0005 adds this env var. Without it bootstrap drops the flags without
+  # a word, so check rather than hope.
+  if [ -n "$RUSTC_FLAGS" ]; then
+    grep -q RUSTC_ONLY_RUSTFLAGS "$SRC/src/bootstrap/src/core/builder/cargo.rs" \
+      || die "source has no RUSTC_ONLY_RUSTFLAGS -- run '$0 fetch' to apply ./patches"
+    export RUSTC_ONLY_RUSTFLAGS="$RUSTC_FLAGS"
+    note "rustflags $RUSTC_FLAGS"
+  fi
 
   say "building stage$STAGE"
   # `compiler library` rather than a bare `./x build`: the default step set
