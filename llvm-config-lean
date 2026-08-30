@@ -68,8 +68,12 @@ zstd_archive() {
   # checkout is. The second is for running llvm-config by hand.
   for c in ${TINYRUST_ZSTD_A:-} \
            "${TINYRUST_ZSTD:-$here/zstd}/$host/lib/libzstd.a"; do
-    [ -n "$c" ] && [ -f "$c" ] && { printf '%s' "$c"; return; }
+    [ -n "$c" ] && [ -f "$c" ] && { printf '%s' "$c"; return 0; }
   done
+  # No zstd is normal: an LLVM built -DLLVM_ENABLE_ZSTD=OFF references none.
+  # Without this the failed test is the function's exit status and set -e
+  # takes llvm-config down with it.
+  return 0
 }
 
 for arg in "$@"; do
