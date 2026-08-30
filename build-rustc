@@ -51,7 +51,7 @@ is_object() {
 # spells them: a path on Mach-O, a soname on ELF.
 bin_deps() {
   case "$OS" in
-    Darwin) otool -L "$1" 2>/dev/null | tail -n +2 | awk '{print $1}' ;;
+    Darwin) otool -L "$1" 2>/dev/null | awk '!/:$/ {print $1}' ;;
     Linux)  readelf -d "$1" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' ;;
   esac
 }
@@ -61,7 +61,7 @@ bin_deps() {
 # anything walks it.
 bin_id() {
   case "$OS" in
-    Darwin) otool -D "$1" 2>/dev/null | tail -n +2 | head -1 ;;
+    Darwin) otool -D "$1" 2>/dev/null | awk '!/:$/ {print; exit}' ;;
     Linux)  readelf -d "$1" 2>/dev/null | sed -n 's/.*(SONAME).*\[\(.*\)\]/\1/p' ;;
   esac
 }
