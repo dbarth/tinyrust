@@ -1,42 +1,14 @@
-# Build a tinyrust toolchain and attach it to a release.
+# Publish a release from compiler artifacts rustc.yml already built. No build
+# here: a release that changes only trustup, install.sh or packaging costs
+# minutes rather than an hour per host, and ships the same compiler binaries
+# rather than equivalent ones.
 #
-# Two builds per host. The first links the -minsizerel LLVM and produces every
-# component; the second links the -O3 one and contributes a single file, the
-# driver, as rustc-alt. The second is a relink in name only -- changing
-# rustc_llvm invalidates the crate graph and fat LTO links the whole thing
-# again -- so a host job is ~50 minutes, not ~30.
-#
-# The awkward parts:
-#
-#   llvm    the unsuffixed artifact is -O3 and builds rustc-alt; -minsizerel
-#           builds the default rustc. `dist-alt` refuses a driver that is not
-#           the larger of the two, which is what catches them being swapped.
-#   disk    the build leaves ~15 GB of intermediates for 250 MB of output, so
-#           `prepare` refuses to start under 25 GB. The Intel image is the
-#           tight one: macos-15-intel is documented at 14 GB. If the x86_64 job
-#           stops at `prepare`, that is why, and the answer is a larger runner
-#           rather than deleting the runner's tools.
-#   arch    one job per host, because rustc, cargo and the optional tools are
-#           native binaries for the machine that built them. Each job packs
-#           only its own rust-std -- that artifact is keyed by target and built
-#           once, by the host that owns it -- and `dist-merge` folds the four
-#           into the one manifest trustup fetches.
-#   image   the Linux jobs build inside ./Dockerfile via ./build-env, and the
-#           macOS jobs run on the runner. The glibc a binary is built against
-#           is the oldest system it will run on, so leaving it to the runner
-#           image would make the floor drift when GitHub updates one. macOS has
-#           no such knob -- the SDK is the platform.
-#   memory  fat LTO links librustc_driver in one process against the whole of
-#           LLVM's static archives. It does not fit in 7 GB: a laptop VM that
-#           size is OOM-killed at exactly that step.
-#   signing binaries are ad-hoc signed by `build-rustc bundle`. Enough to run,
-#           but not notarized: a browser download would get a Gatekeeper
-#           prompt. curl does not set the quarantine bit, which is why the
-#           installer uses it.
+# Run rustc.yml first when rust or LLVM moves; otherwise its tag already holds
+# what this needs.
 name: release
 
 env:
-  LLVM_VERSION: "22.1.8"
+  RUSTC_TAG: "tiny-rustc-1.98.0-llvm-22.1.8"
 
 on:
   workflow_dispatch:
@@ -44,175 +16,44 @@ on:
       tag:
         description: "release tag to publish to"
         required: true
-  # No push trigger. Releases are dispatched by hand, so a stray tag cannot
-  # start an hour-long build.
 
-# Default repo token is read-only; creating a release needs this.
 permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      # Let the other hosts finish rather than cancelling them, so one failure
-      # reports every result. `publish` needs the whole matrix regardless: each
-      # host owns one rust-std, so a partial release would carry no std for the
-      # missing one. All hosts or none.
-      fail-fast: false
-      matrix:
-        include:
-          - host: aarch64-apple-darwin
-            runner: macos-15
-          - host: x86_64-apple-darwin
-            runner: macos-15-intel
-          - host: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-          - host: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # Nothing here deletes anything. A throwaway runner that is short of
-      # space is a runner-image problem, not something a workflow should paper
-      # over by deleting the developer tools.
-      - name: prepare
-        env:
-          NEED: "25"       # GB: ~15 GB of intermediates, with room
-        run: |
-          # -k rather than -g: BSD df has no -g on Linux and GNU df has no -g
-          # at all. 1024-blocks are the one unit both agree on.
-          avail=$(df -k . | tail -1 | awk '{print int($4/1048576)}')
-          echo "$avail GB free, need $NEED"
-          [ "$avail" -ge "$NEED" ] || { echo "not enough disk"; exit 1; }
-
-      # A relabelled image would otherwise build an arm64 toolchain and publish
-      # it as Intel.
-      - name: check host
-        run: |
-          case "$(uname -s)/$(uname -m)/${{ matrix.host }}" in
-            Darwin/arm64/aarch64-apple-darwin) ;;
-            Darwin/x86_64/x86_64-apple-darwin) ;;
-            Linux/aarch64/aarch64-unknown-linux-gnu) ;;
-            Linux/x86_64/x86_64-unknown-linux-gnu) ;;
-            *) echo "runner is $(uname -s)/$(uname -m), job claims ${{ matrix.host }}"
-               exit 1 ;;
-          esac
-
-      # Both, now, and copied into the workspace: build-env mounts the working
-      # tree and nothing else.
-      - name: fetch llvm
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for a in tinyrust-llvm-$LLVM_VERSION-${{ matrix.host }}-minsizerel.tar.xz \
-                   tinyrust-llvm-$LLVM_VERSION-${{ matrix.host }}.tar.xz; do
-            gh release download llvm-$LLVM_VERSION --repo "$GITHUB_REPOSITORY" \
-              --pattern "$a" --dir "$RUNNER_TEMP" --clobber
-            cp "$RUNNER_TEMP/$a" "$a"
-          done
-
-      - name: fetch rust
-        run: ./build-env ./build-rustc fetch
-
-      # ---- the default toolchain, against the -minsizerel llvm -------------
-
-      - name: build
-        env:
-          RUSTC_LTO: fat       # dist refuses anything else
-          RUSTC_STAGE: "2"
-        run: |
-          TINYRUST_LLVM_URL="file://$PWD/tinyrust-llvm-$LLVM_VERSION-${{ matrix.host }}-minsizerel.tar.xz" \
-            ./build-env ./build-rustc llvm --force
-          ./build-env ./build-rustc configure
-          ./build-env ./build-rustc build
-
-      - name: trim, strip, verify
-        env: { RUSTC_STAGE: "2" }
-        run: |
-          ./build-env ./build-rustc trim
-          ./build-env ./build-rustc strip
-          ./build-env ./build-rustc verify
-
-      # TARGETS defaults to this host's own target, so each job packs exactly
-      # one rust-std and the two never collide in the release.
-      - name: package
-        env:
-          RUSTC_LTO: fat
-          RUSTC_STAGE: "2"
-          # Without this the manifest points at this runner's disk.
-          TINYRUST_DIST_BASE: https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag || github.ref_name }}
-        run: |
-          ./build-env ./build-rustc dist
-          ls -l dist
-
-      - name: measure
-        env: { RUSTC_STAGE: "2" }
-        run: ./build-env ./build-rustc measure || true
-
-      # ---- the alternative driver, against the -O3 llvm --------------------
-
-      - name: build rustc-alt
-        env:
-          RUSTC_LTO: fat
-          RUSTC_STAGE: "2"
-          TINYRUST_DIST_BASE: https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag || github.ref_name }}
-        run: |
-          TINYRUST_LLVM_URL="file://$PWD/tinyrust-llvm-$LLVM_VERSION-${{ matrix.host }}.tar.xz" \
-            ./build-env ./build-rustc llvm --force
-          ./build-env ./build-rustc configure
-          ./build-env ./build-rustc build
-          ./build-env ./build-rustc strip
-          mkdir -p alt
-          cp rust/build/${{ matrix.host }}/stage2/lib/librustc_driver-* alt/
-          ./build-env ./build-rustc dist-alt
-          ls -l dist
-
-      # The packages this job just built, installed and used the way a reader
-      # of the README would. It has caught a component with no entry point, a
-      # manifest trustup could not parse, and a tree that was never trimmed --
-      # none of which `verify` or `measure` look at. --dist repoints the
-      # manifest at the local copy, since its URLs are the release ones and the
-      # release does not exist yet.
-      - name: check
-        run: ./build-env ./check --dist dist
-
-      # The other machine a Linux user might have: no compiler, no python3, an
-      # older glibc than the build image. Runs on the runner rather than
-      # through build-env, because it starts containers of its own.
-      - name: check on a bare machine
-        if: runner.os == 'Linux'
-        run: ./check --in debian:12-slim --dist dist
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: dist-${{ matrix.host }}
-          path: dist
-          retention-days: 1
-
-  # One channel manifest covers every host, the way channel-rust-stable.toml
-  # does. trustup fetches that one file and selects by its own host triple, so
-  # this is the step that makes an Intel install work -- not anything in
-  # install.sh.
   publish:
-    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: hosts
-          pattern: dist-*
-
-      - name: merge manifests
+      # One tar per host, each the dist directory as that host packed it.
+      - name: fetch the compiler
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          ./build-rustc dist-merge release hosts/dist-*
+          mkdir -p tars
+          gh release download "$RUSTC_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.tar' --dir tars
+          for t in tars/*.tar; do
+            d="hosts/$(basename "$t" .tar)"
+            mkdir -p "$d" && tar xf "$t" -C "$d"
+          done
+          ls hosts
+
+      # One channel manifest covers every host, the way channel-rust-stable.toml
+      # does: trustup fetches that one file and selects by its own host triple.
+      # TINYRUST_DIST_BASE repoints every xz_url from the compiler tag to this
+      # release, which is the only thing that has to change.
+      - name: merge manifests
+        env:
+          TINYRUST_DIST_BASE: https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}
+        run: |
+          ./build-rustc dist-merge release hosts/*
           ls -l release
+          grep -m1 xz_url release/channel-rust-*.toml
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           files: release/*
           fail_on_unmatched_files: true

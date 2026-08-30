@@ -1098,7 +1098,7 @@ cmd_dist_merge() {
 
   say "merging $# manifests"
   python3 - "$out/channel-rust-$chan.toml" "$chan" "$@" <<'MERGE' || die "merge failed"
-import re, sys
+import os, re, sys
 out, chan, inputs = sys.argv[1], sys.argv[2], sys.argv[3:]
 
 head, blocks, seen = "", [], {}
@@ -1121,9 +1121,15 @@ for i, d in enumerate(inputs):
         seen[key] = d
         blocks.append(key + "\n" + body.rstrip("\n") + "\n\n")
 
+# The inputs carry the URLs of whatever release they were built for. A
+# release republishes them under its own tag, so repoint them.
+base = os.environ.get("TINYRUST_DIST_BASE", "")
+text = head.rstrip("\n") + "\n\n" + "".join(blocks)
+if base:
+    text = re.sub(r'xz_url = "[^"]*/([^"/]+)"', f'xz_url = "{base}/\\1"', text)
+
 with open(out, "w", encoding="utf-8") as f:
-    f.write(head.rstrip("\n") + "\n\n")
-    f.writelines(blocks)
+    f.write(text)
 
 for key in sorted(seen):
     print(f"  {key[5:-1]:<44} {seen[key]}")
