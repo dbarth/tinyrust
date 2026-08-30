@@ -124,6 +124,16 @@ sha256() { case "$OS" in
              Linux)  sha256sum "$1" | cut -d' ' -f1 ;;
            esac; }
 
+# The xz branch filter for this host, empty if xz does not know it. --arm64
+# arrived in xz 5.4, so probing the builder also answers for the user: the
+# Linux build image is the oldest system we claim to run on.
+bcj() {
+  local f=""
+  case "$HOST" in aarch64-*) f="--arm64" ;; x86_64-*) f="--x86" ;; esac
+  [ -n "$f" ] && printf '' | xz $f --lzma2 -c >/dev/null 2>&1 || f=""
+  printf '%s' "$f"
+}
+
 # What a shipped binary is allowed to depend on.
 #
 # macOS answers with two directory prefixes, because the OS ships one library
@@ -944,13 +954,9 @@ cmd_dist() {
     # Branch filter: relative call targets rewritten to absolute before LZMA.
     # 11.1% off rustc, 8.7% off cargo, nothing to decode. Per component, since
     # rust-std is .rmeta and bitcode rather than machine code and comes out
-    # 3.6% bigger filtered. --arm64 needs xz 5.4 to unpack.
+    # 3.6% bigger filtered. --arm64 needs xz 5.4 to write or unpack.
     local filter=""
-    case "$pkg/$HOST" in
-      rust-std/*)  filter="" ;;
-      */aarch64-*) filter="--arm64" ;;
-      */x86_64-*)  filter="--x86" ;;
-    esac
+    case "$pkg" in rust-std) ;; *) filter="$(bcj)" ;; esac
     ( cd "$dist/.stage" && tar cf - "$stem" ) \
       | xz -T0 $filter --lzma2=preset=9 > "$dist/$stem.tar.xz"
     rm -rf "$dist/.stage"
@@ -1050,8 +1056,7 @@ Likely the two were built against the same LLVM: the unsuffixed artifact is
   local stage="$dist/.stage/$stem/rustc-alt/lib"
   rm -rf "$dist/.stage"; mkdir -p "$stage"
   cp "$drv" "$stage/"
-  local filter=""
-  case "$HOST" in aarch64-*) filter="--arm64" ;; x86_64-*) filter="--x86" ;; esac
+  local filter; filter="$(bcj)"
   ( cd "$dist/.stage" && tar cf - "$stem" ) \
     | xz -T0 $filter --lzma2=preset=9 > "$dist/$stem.tar.xz"
   rm -rf "$dist/.stage"
